@@ -1,0 +1,141 @@
+#include <SPI.h>
+#include <Ethernet.h>
+
+// Ethernet configuration
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+IPAddress ip(192, 168, 1, 177);        // Static IP for Arduino
+IPAddress gateway(192, 168, 1, 1);     // Gateway (your laptop/router)
+IPAddress subnet(255, 255, 255, 0);    // Subnet mask
+
+// Server on port 5000
+EthernetServer server(5000);
+
+// Variables for incoming data
+String inputBuffer = "";
+bool newData = false;
+
+void setup() {
+  // Initialize serial and wait for port to open
+  Serial.begin(115200);
+  delay(1000); // Give serial time to start
+  
+  Serial.println("Arduino Ethernet Server starting...");
+  
+  // Initialize Ethernet hardware
+  Serial.println("Initializing Ethernet hardware...");
+  
+  // Some Ethernet shields need this to be explicitly called
+  pinMode(10, OUTPUT);
+  digitalWrite(10, HIGH);
+  
+  // Initialize SPI
+  SPI.begin();
+  delay(100);
+  
+  // Skip DHCP and use only static IP configuration
+  Serial.println("Configuring with static IP...");
+  Ethernet.begin(mac, ip, gateway, subnet);
+  
+  // Give the Ethernet shield time to initialize
+  delay(1000);
+  
+  // Check if Ethernet initialized properly
+  if (Ethernet.localIP() == IPAddress(0, 0, 0, 0)) {
+    Serial.println("❌ CRITICAL ERROR: Failed to configure Ethernet");
+    Serial.println("Check if Ethernet shield is properly connected");
+    while(true) {
+      // Stop here if Ethernet failed
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(300);
+      digitalWrite(LED_BUILTIN, LOW);
+      delay(300);
+    }
+  }
+  
+  // Start the server
+  server.begin();
+  
+  // Print network info
+  Serial.println("✅ Ethernet configuration successful!");
+  Serial.print("🔗 IP address: ");
+  Serial.println(Ethernet.localIP());
+  Serial.print("🌐 Gateway: ");
+  Serial.println(gateway);
+  Serial.print("🔍 Subnet: ");
+  Serial.println(subnet);
+  Serial.println("⏳ Waiting for connections on port 5000...");
+}
+
+void loop() {
+  // Check if there are any new client connections
+  EthernetClient client = server.available();
+  
+  if (client) {
+    Serial.println("🔗 Client connected!");
+    inputBuffer = "";
+    
+    // Keep the connection open until closed by the client
+    while (client.connected()) {
+      // Check if there's data available to read
+      if (client.available()) {
+        char c = client.read();
+        inputBuffer += c;
+        
+        // Process data when we get a newline or buffer is getting full
+        if (c == '\n' || inputBuffer.length() > 100) {
+          newData = true;
+          break;
+        }
+      }
+    }
+    
+    // Process received data
+    if (newData) {
+      Serial.print("📬 Received: ");
+      Serial.println(inputBuffer);
+      
+      // Generate a response
+      String response = processCommand(inputBuffer);
+      
+      // Send HTTP response
+      client.println("HTTP/1.1 200 OK");
+      client.println("Content-Type: text/plain");
+      client.println("Connection: close");
+      client.println();
+      client.println(response);
+      
+      Serial.println("📩 Response sent!");
+      
+      // Close the connection
+      delay(10);
+      client.stop();
+      newData = false;
+    }
+  }
+}
+
+// Process the received command
+String processCommand(String cmd) {
+  cmd.trim();
+  String result = "";
+  
+  if (cmd.indexOf("status") >= 0) {
+    result += "✅ STATUS: OK\n";
+    result += "Uptime: " + String(millis() / 1000) + " seconds\n";
+    result += "IP: " + Ethernet.localIP().toString() + "\n";
+  }
+  else if (cmd.indexOf("data:") >= 0) {
+    int idx = cmd.indexOf("data:");
+    String data = cmd.substring(idx + 5);
+    result += "📥 DATA RECEIVED: " + data + "\n";
+  }
+  else if (cmd.indexOf("Hello Arduino") >= 0) {
+    result += "👋 Hello from Arduino! I received your message.\n";
+    result += "Message was: " + cmd + "\n";
+  }
+  else {
+    result = "⚠️ Unknown command. Available commands: status, data:[text]";
+  }
+  
+  return result;
+}
