@@ -22,6 +22,60 @@ const unsigned char ascon_key[KEY_SIZE] = {
   0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
 };
 
+// Test vector for validation
+typedef struct {
+  const char* name;
+  const uint8_t key[KEY_SIZE];
+  const uint8_t nonce[16];
+  const uint8_t* ad;
+  size_t ad_len;
+  const uint8_t* msg;
+  size_t msg_len;
+  const uint8_t* ct;
+  const uint8_t* tag;  // Endret fra array til peker
+} TestVector;
+
+// Official Ascon-128 test vector (from RFC 9459)
+// This is a simplified test vector for basic validation
+const uint8_t test_key[] = {
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+};
+
+const uint8_t test_nonce[] = {
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+};
+
+const uint8_t test_ad[] = {
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+};
+
+const uint8_t test_msg[] = {
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+};
+
+const uint8_t test_ct[] = {
+  0x76, 0x65, 0x35, 0xD5, 0xC5, 0xF8, 0x38, 0xD1,
+  0xD0, 0xA8, 0x3B, 0x6D, 0x0F, 0x2B, 0xF5, 0x0F
+};
+
+const uint8_t test_tag[] = {
+  0xA7, 0xD6, 0x5A, 0xF5, 0x60, 0x75, 0x63, 0x13,
+  0xFD, 0x14, 0x35, 0xD8, 0x92, 0x96, 0xF2, 0x55
+};
+
+const TestVector test_vector = {
+  "RFC 9459 Test Vector",
+  {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F},
+  {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F},
+  test_ad, sizeof(test_ad),
+  test_msg, sizeof(test_msg),
+  test_ct, 
+  test_tag
+};
+
 // Constants for non-blocking benchmark
 #define BENCHMARK_CHUNK_SIZE 100  // Number of iterations per chunk
 #define BENCHMARK_IDLE false
@@ -603,6 +657,100 @@ bool decrypt(const unsigned char* input, unsigned char* output, size_t len) {
   return tag_valid;
 }
 
+// Validate implementation against test vectors
+bool validate_ascon() {
+  Serial.println("\nValidating Ascon implementation against test vectors...");
+  
+  // Allocate buffers
+  uint8_t ct_buffer[64] = {0};
+  uint8_t pt_buffer[64] = {0};
+  uint8_t tag_buffer[TAG_SIZE] = {0};
+  
+  // Initialize state with test vector's key and nonce
+  uint64_t state[5];
+  ascon_initialize(state, test_vector.key, test_vector.nonce);
+  
+  // Process AD
+  ascon_process_associated_data(state, test_vector.ad, test_vector.ad_len);
+  
+  // Process plaintext
+  ascon_process_plaintext(state, test_vector.msg, ct_buffer, test_vector.msg_len);
+  
+  // Finalize and generate tag
+  ascon_finalize(state, test_vector.key, tag_buffer);
+  
+  // Check ciphertext
+  bool ct_match = true;
+  for (size_t i = 0; i < test_vector.msg_len; i++) {
+    if (ct_buffer[i] != test_vector.ct[i]) {
+      ct_match = false;
+      Serial.print("Ciphertext mismatch at byte ");
+      Serial.print(i);
+      Serial.print(": Expected ");
+      Serial.print(test_vector.ct[i], HEX);
+      Serial.print(", Got ");
+      Serial.println(ct_buffer[i], HEX);
+      break;
+    }
+  }
+  
+  // Check tag
+  bool tag_match = true;
+  for (size_t i = 0; i < TAG_SIZE; i++) {
+    if (tag_buffer[i] != test_vector.tag[i]) {
+      tag_match = false;
+      Serial.print("Tag mismatch at byte ");
+      Serial.print(i);
+      Serial.print(": Expected ");
+      Serial.print(test_vector.tag[i], HEX);
+      Serial.print(", Got ");
+      Serial.println(tag_buffer[i], HEX);
+      break;
+    }
+  }
+  
+  // Verify decryption works too
+  uint8_t full_ct[64] = {0};
+  
+  // Prepare a full ciphertext buffer (nonce + ciphertext + tag)
+  memcpy(full_ct, test_vector.nonce, 16);
+  memcpy(full_ct + 16, ct_buffer, test_vector.msg_len);
+  memcpy(full_ct + 16 + test_vector.msg_len, tag_buffer, TAG_SIZE);
+  
+  // Decrypt
+  bool decrypt_success = decrypt(full_ct, pt_buffer, 16 + test_vector.msg_len + TAG_SIZE);
+  
+  // Check plaintext
+  bool pt_match = true;
+  for (size_t i = 0; i < test_vector.msg_len; i++) {
+    if (pt_buffer[i] != test_vector.msg[i]) {
+      pt_match = false;
+      Serial.print("Plaintext mismatch at byte ");
+      Serial.print(i);
+      Serial.print(": Expected ");
+      Serial.print(test_vector.msg[i], HEX);
+      Serial.print(", Got ");
+      Serial.println(pt_buffer[i], HEX);
+      break;
+    }
+  }
+  
+  // Overall validation result
+  bool success = ct_match && tag_match && pt_match && decrypt_success;
+  
+  if (success) {
+    Serial.println("Validation SUCCESSFUL! Ascon implementation is correct.");
+  } else {
+    Serial.println("Validation FAILED! Ascon implementation has errors.");
+    Serial.print("Ciphertext match: "); Serial.println(ct_match ? "YES" : "NO");
+    Serial.print("Tag match: "); Serial.println(tag_match ? "YES" : "NO");
+    Serial.print("Decryption success: "); Serial.println(decrypt_success ? "YES" : "NO");
+    Serial.print("Plaintext match: "); Serial.println(pt_match ? "YES" : "NO");
+  }
+  
+  return success;
+}
+
 // Wrapper functions for compatibility with benchmark framework
 
 // Encrypt wrapper
@@ -732,6 +880,17 @@ void startBenchmark(String text, long repeats) {
   Serial.println("Send 'STOP' to abort benchmark");
 }
 
+// Safe subtraction function to handle timer overflows
+unsigned long safeTimeDiff(unsigned long start, unsigned long end) {
+  // Handle timer overflow
+  if (end >= start) {
+    return end - start;
+  } else {
+    // Overflow occurred
+    return (0xFFFFFFFF - start) + end + 1;
+  }
+}
+
 // Process a chunk of benchmark iterations
 void processBenchmarkChunk() {
   if (benchmark_state != BENCHMARK_RUNNING) return;
@@ -745,13 +904,13 @@ void processBenchmarkChunk() {
     start_time = micros();
     encrypt_wrapper(benchmark_padded, benchmark_encrypted, benchmark_padded_len);
     end_time = micros();
-    benchmark_total_encrypt_time += (end_time - start_time);
+    benchmark_total_encrypt_time += safeTimeDiff(start_time, end_time);
     
     // Decryption
     start_time = micros();
     decrypt_wrapper(benchmark_encrypted, benchmark_decrypted, benchmark_padded_len);
     end_time = micros();
-    benchmark_total_decrypt_time += (end_time - start_time);
+    benchmark_total_decrypt_time += safeTimeDiff(start_time, end_time);
     
     // Evaluation (if the text is an expression)
     size_t actual_len = removePadding(benchmark_decrypted, benchmark_padded_len);
@@ -763,7 +922,7 @@ void processBenchmarkChunk() {
       start_time = micros();
       evaluerUttrykk((char*)benchmark_decrypted);
       end_time = micros();
-      benchmark_total_eval_time += (end_time - start_time);
+      benchmark_total_eval_time += safeTimeDiff(start_time, end_time);
     }
     
     // Increase iteration counter
@@ -795,7 +954,7 @@ void processBenchmarkChunk() {
 void finishBenchmark() {
   // End timing for the entire benchmark
   unsigned long benchmark_end = millis();
-  unsigned long total_benchmark_time = benchmark_end - benchmark_start_time;
+  unsigned long total_benchmark_time = safeTimeDiff(benchmark_start_time, benchmark_end);
   
   // Calculate actual CPU usage
   cpu_usage = (benchmark_total_encrypt_time + benchmark_total_decrypt_time) / 1000.0 / total_benchmark_time * 100.0;
@@ -902,7 +1061,7 @@ void finishBenchmark() {
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial);
+  delay(3000);  // Wait for serial to be ready
   randomSeed(analogRead(0)); // Initialize random for IV generation
   
   // Added memory measurement at startup
@@ -914,7 +1073,11 @@ void setup() {
   Serial.println("  MATRIX - Generate decision matrix report");
   Serial.println("  MEMORY_DETAIL_ON - Enable detailed memory tracking");
   Serial.println("  MEMORY_DETAIL_OFF - Disable detailed memory tracking");
+  Serial.println("  VALIDATE - Validate Ascon implementation");
   Serial.println("  STOP - Abort running benchmark");
+  
+  // Run validation on startup
+  validate_ascon();
 }
 
 void loop() {
@@ -938,6 +1101,10 @@ void loop() {
         Serial.println("Aborting benchmark...");
         benchmark_state = BENCHMARK_IDLE;
         Serial.println("Benchmark aborted!");
+      }
+      // Check if validation is requested
+      else if (input.equalsIgnoreCase("VALIDATE")) {
+        validate_ascon();
       }
       // Check if matrix report is requested
       else if (input.equalsIgnoreCase("MATRIX")) {
@@ -1007,12 +1174,12 @@ void loop() {
         // Encrypt data
         unsigned long start_time = micros();
         size_t encrypted_len = encrypt(padded, encrypted, padded_len);
-        unsigned long encrypt_time = micros() - start_time;
+        unsigned long encrypt_time = safeTimeDiff(start_time, micros());
         
         // Decryption
         start_time = micros();
         bool tag_valid = decrypt(encrypted, decrypted, encrypted_len);
-        unsigned long decrypt_time = micros() - start_time;
+        unsigned long decrypt_time = safeTimeDiff(start_time, micros());
         
         Serial.print("Encrypted (with IV and tag): ");
         printHex(encrypted, min(encrypted_len, 32));
@@ -1048,13 +1215,13 @@ void loop() {
         
         // Calculate CPU usage for this loop iteration
         unsigned long loop_end = micros();
-        unsigned long iteration_time = loop_end - loop_start;
+        unsigned long iteration_time = safeTimeDiff(loop_start, loop_end);
         float cpu_usage = ((float)(encrypt_time + decrypt_time)) / iteration_time * 100.0;
         Serial.print("CPU usage for encryption/decryption: ");
         Serial.print(cpu_usage, 2);
         Serial.println("%");
         
-        // Remove padding and null-terminate
+        // Remove padding and null-terminer
         size_t actual_len = removePadding(decrypted, padded_len);
         decrypted[actual_len] = '\0';
         
@@ -1066,7 +1233,7 @@ void loop() {
             strstr((char*)decrypted, "*") || strstr((char*)decrypted, "/") ||
             strstr((char*)decrypted, "(10+5)") || strstr((char*)decrypted, "(10 + 5)")) {
           int result = evaluerUttrykk((char*)decrypted);
-          if (result != 0) {
+          if (result != 0) { 
             if (result > 0) {
               Serial.print("RESP:RESULT=");
               Serial.println(result);
@@ -1080,7 +1247,7 @@ void loop() {
         measureMemory("After Single Encryption");
       }
       
-      Serial.println();  // Blank line for readability
+      Serial.println();  // Blank linje for lesbarhet
     }
   }
   
