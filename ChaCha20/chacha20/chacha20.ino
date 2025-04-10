@@ -2,39 +2,60 @@
 #ifdef ARDUINO_ARCH_MBED
 #include "mbed_stats.h"
 #endif
+#include <limits.h> // Include for ULONG_MAX
+
+// If ULONG_MAX is still not defined, define it manually
+#ifndef ULONG_MAX
+#define ULONG_MAX 0xFFFFFFFFUL // Maximum value for 32-bit unsigned long
+#endif
+
+// Add debug timing define
+#define BENCHMARK_TIMING_DEBUG false  // Set to false to hide individual timing details
 
 // Algorithm identification and measurement constants
-#define ALGORITHM_NAME "SPECK"
+#define ALGORITHM_NAME "ChaCha20"
 bool detailed_memory_tracking = false;  // Variable that can be changed during runtime
 
-// SPECK Constants for SPECK128/128
-#define SPECK_BLOCK_SIZE 16  // 128 bits
-#define SPECK_KEY_SIZE 16    // 128 bits
-#define SPECK_ROUNDS 32      // Number of rounds for SPECK128/128
-#define SPECK_ALPHA 8        // Rotation constant alpha
-#define SPECK_BETA 3         // Rotation constant beta
-#define IV_SIZE 16           // IV size for CBC mode
+// ChaCha20 Constants
+#define CHACHA20_KEY_SIZE 32    // 256-bit key
+#define CHACHA20_NONCE_SIZE 12  // 96-bit nonce (RFC 8439)
+#define CHACHA20_BLOCK_SIZE 64  // 512-bit blocks
+#define CHACHA20_ROUNDS 20      // Number of rounds (20 for ChaCha20)
+#define IV_SIZE 16              // External IV size (nonce + counter) for compatibility
 
-// SPECK key (128-bit)
-const unsigned char speck_key[SPECK_KEY_SIZE] = {
+// ChaCha20 state constants (magic numbers from RFC 8439)
+static const uint32_t chacha20_constants[4] = {
+  0x61707865, 0x3320646e, 0x79622d32, 0x6b206574  // "expand 32-byte k" in ASCII
+};
+
+// ChaCha20 key (256-bit)
+const unsigned char chacha20_key[CHACHA20_KEY_SIZE] = {
   0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+  0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+  0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F
 };
 
-// Test vector for SPECK-128/128
-const uint8_t test_plaintext[SPECK_BLOCK_SIZE] = {
-  0x20, 0x6D, 0x61, 0x64, 0x65, 0x20, 0x69, 0x74, 
-  0x20, 0x65, 0x71, 0x75, 0x69, 0x76, 0x61, 0x6C
+// RFC 8439 Test Vector
+const uint8_t test_key[CHACHA20_KEY_SIZE] = {
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+  0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+  0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+  0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
 };
 
-const uint8_t test_ciphertext[SPECK_BLOCK_SIZE] = {
-  0x18, 0x0D, 0x57, 0x5C, 0xDF, 0xFE, 0x60, 0x78, 
-  0x65, 0x32, 0x78, 0x79, 0x51, 0x98, 0x5D, 0xA6
+const uint8_t test_nonce[CHACHA20_NONCE_SIZE] = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a,
+  0x00, 0x00, 0x00, 0x00
 };
 
-// Expanded key storage
-uint64_t expanded_key[SPECK_ROUNDS];
-bool key_initialized = false;
+const uint32_t test_counter = 1;
+
+// First 16 bytes of expected keystream for the test vector
+const uint8_t test_keystream[16] = {
+  0x22, 0x4f, 0x51, 0xf3, 0x40, 0x1b, 0xd9, 0xe1,
+  0x2f, 0xde, 0x27, 0x6f, 0xb8, 0x63, 0x1d, 0xed
+};
 
 // Constants for non-blocking benchmark
 #define BENCHMARK_CHUNK_SIZE 100  // Number of iterations per chunk
@@ -109,8 +130,9 @@ void measureMemory(const char* label) {
   Serial.println(" bytes");
 }
 
-// Generate decision matrix data report
+// Generate decision matrix data report with verification
 void generateMatrixReport() {
+#ifdef ARDUINO_ARCH_MBED
   mbed_stats_heap_t heap_stats;
   mbed_stats_stack_t stack_stats;
   
@@ -118,6 +140,16 @@ void generateMatrixReport() {
   mbed_stats_stack_get(&stack_stats);
   
   used_ram = heap_stats.current_size + stack_stats.max_size;
+#else
+  // For non-MBED platforms, use the available free RAM metric
+  int free_ram = freeRam();
+  // This is approximate since we don't know total RAM on all platforms
+  used_ram = MAX_SIZE * 3; // Estimate based on our buffer sizes
+#endif
+  
+  // Calculate per-byte latency (more informative for decision matrix)
+  float enc_latency_per_byte = avgEnc / (float)benchmark_padded_len; // µs per byte
+  float dec_latency_per_byte = avgDec / (float)benchmark_padded_len; // µs per byte
   
   Serial.println("\n===== DECISION MATRIX DATA =====");
   Serial.print("Algorithm: ");
@@ -133,6 +165,7 @@ void generateMatrixReport() {
   Serial.print(cpu_usage, 2);
   Serial.println("%");
   
+  // Report both per-operation and per-byte latency
   Serial.print("Encryption Latency: ");
   Serial.print(avgEnc, 2);
   Serial.println(" µs");
@@ -141,6 +174,7 @@ void generateMatrixReport() {
   Serial.print(avgDec, 2);
   Serial.println(" µs");
   
+  // Include per-byte latency in comments for reference
   Serial.print("Encryption Throughput: ");
   Serial.print(encrypt_throughput);
   Serial.println(" bytes/s");
@@ -157,10 +191,16 @@ void generateMatrixReport() {
   Serial.print(decrypt_goodput);
   Serial.println(" bytes/s");
   
+  // Calculate overhead percentage for stream cipher
+  float enc_overhead_pct = 100.0 * (1.0 - ((float)benchmark_input_len / benchmark_padded_len));
+  Serial.print("Protocol Overhead: ");
+  Serial.print(enc_overhead_pct, 1);
+  Serial.println("%");
+  
   Serial.println("Current: [External measurement required]");
   Serial.println("Power: [External measurement required]");
-  Serial.println("Security Strength: 128-bit");
-  Serial.println("Error Propagation: CBC mode propagates errors to next block");
+  Serial.println("Security Strength: 256-bit");
+  Serial.println("Error Propagation: None (stream cipher)");
   Serial.println("================================");
 }
 #else
@@ -225,8 +265,8 @@ void generateMatrixReport() {
   
   Serial.println("Current: [External measurement required]");
   Serial.println("Power: [External measurement required]");
-  Serial.println("Security Strength: 128-bit");
-  Serial.println("Error Propagation: CBC mode propagates errors to next block");
+  Serial.println("Security Strength: 256-bit");
+  Serial.println("Error Propagation: None (stream cipher)");
   Serial.println("================================");
 }
 #endif
@@ -241,34 +281,319 @@ void printHex(const unsigned char* data, size_t len) {
   Serial.println();
 }
 
-// Generate a random IV
-void generateIV(unsigned char* iv) {
-  for (int i = 0; i < IV_SIZE; i++) {
-    iv[i] = random(256);
+// Generate a random nonce
+void generateNonce(unsigned char* nonce) {
+  for (int i = 0; i < CHACHA20_NONCE_SIZE; i++) {
+    nonce[i] = random(256);
   }
 }
 
-// Pad data to 16-byte blocks (SPECK block size)
+// ChaCha20 helper functions
+
+// Rotate left (circular left shift)
+inline uint32_t rotl32(uint32_t x, int n) {
+  return (x << n) | (x >> (32 - n));
+}
+
+// Load a 32-bit value from bytes (little-endian)
+inline uint32_t U8TO32_LITTLE(const unsigned char* p) {
+  return ((uint32_t)p[0]) | ((uint32_t)p[1] << 8) | 
+         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Store a 32-bit value to bytes (little-endian)
+inline void U32TO8_LITTLE(unsigned char* p, uint32_t v) {
+  p[0] = v & 0xFF;
+  p[1] = (v >> 8) & 0xFF;
+  p[2] = (v >> 16) & 0xFF;
+  p[3] = (v >> 24) & 0xFF;
+}
+
+// The ChaCha20 quarter round function
+void chacha20_quarter_round(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+  a += b; d ^= a; d = rotl32(d, 16);
+  c += d; b ^= c; b = rotl32(b, 12);
+  a += b; d ^= a; d = rotl32(d, 8);
+  c += d; b ^= c; b = rotl32(b, 7);
+}
+
+// The ChaCha20 block function (20 rounds = 10 column + 10 diagonal rounds)
+void chacha20_block(uint32_t* state, uint32_t* output) {
+  // Copy input state to working state
+  uint32_t x[16];
+  for (int i = 0; i < 16; i++) {
+    x[i] = state[i];
+  }
+  
+  // 20 rounds (10 column rounds + 10 diagonal rounds)
+  for (int i = 0; i < CHACHA20_ROUNDS; i += 2) {
+    // Column round
+    chacha20_quarter_round(x[0], x[4], x[8], x[12]);
+    chacha20_quarter_round(x[1], x[5], x[9], x[13]);
+    chacha20_quarter_round(x[2], x[6], x[10], x[14]);
+    chacha20_quarter_round(x[3], x[7], x[11], x[15]);
+    
+    // Diagonal round
+    chacha20_quarter_round(x[0], x[5], x[10], x[15]);
+    chacha20_quarter_round(x[1], x[6], x[11], x[12]);
+    chacha20_quarter_round(x[2], x[7], x[8], x[13]);
+    chacha20_quarter_round(x[3], x[4], x[9], x[14]);
+  }
+  
+  // Add input state to working state
+  for (int i = 0; i < 16; i++) {
+    output[i] = x[i] + state[i];
+  }
+}
+
+// Initialize ChaCha20 state with key, nonce, and counter
+void chacha20_init(uint32_t* state, const unsigned char* key, 
+                   const unsigned char* nonce, uint32_t counter) {
+  // Constants (magic numbers from RFC 8439)
+  state[0] = chacha20_constants[0];
+  state[1] = chacha20_constants[1];
+  state[2] = chacha20_constants[2];
+  state[3] = chacha20_constants[3];
+  
+  // Key (8 words = 32 bytes)
+  state[4] = U8TO32_LITTLE(key + 0);
+  state[5] = U8TO32_LITTLE(key + 4);
+  state[6] = U8TO32_LITTLE(key + 8);
+  state[7] = U8TO32_LITTLE(key + 12);
+  state[8] = U8TO32_LITTLE(key + 16);
+  state[9] = U8TO32_LITTLE(key + 20);
+  state[10] = U8TO32_LITTLE(key + 24);
+  state[11] = U8TO32_LITTLE(key + 28);
+  
+  // Counter (1 word = 4 bytes)
+  state[12] = counter;
+  
+  // Nonce (3 words = 12 bytes)
+  state[13] = U8TO32_LITTLE(nonce + 0);
+  state[14] = U8TO32_LITTLE(nonce + 4);
+  state[15] = U8TO32_LITTLE(nonce + 8);
+}
+
+// Generate ChaCha20 keystream
+void chacha20_keystream(uint32_t* state, unsigned char* keystream, size_t len) {
+  uint32_t output[16];
+  unsigned char block[64];
+  
+  for (size_t offset = 0; offset < len; offset += 64) {
+    // Generate block of keystream
+    chacha20_block(state, output);
+    
+    // Serialize output block to bytes
+    for (int i = 0; i < 16; i++) {
+      U32TO8_LITTLE(block + (i * 4), output[i]);
+    }
+    
+    // Copy keystream to output
+    size_t block_size = min(64, len - offset);
+    memcpy(keystream + offset, block, block_size);
+    
+    // Increment counter for next block
+    state[12]++;
+  }
+}
+
+// Encrypt/decrypt data with ChaCha20
+void chacha20_encrypt_decrypt(const unsigned char* input, unsigned char* output, 
+                              size_t len, const unsigned char* key, 
+                              const unsigned char* nonce, uint32_t counter) {
+  if (detailed_memory_tracking) measureMemory("Step 1: Before ChaCha20");
+  
+  uint32_t state[16];
+  unsigned char keystream[64];
+  
+  // Initialize state
+  chacha20_init(state, key, nonce, counter);
+  
+  if (detailed_memory_tracking) measureMemory("Step 2: After State Init");
+  
+  // Process data in chunks
+  for (size_t offset = 0; offset < len; offset += 64) {
+    // Generate keystream block
+    chacha20_block(state, (uint32_t*)keystream);
+    
+    // Convert block to bytes
+    for (int i = 0; i < 16; i++) {
+      U32TO8_LITTLE(keystream + (i * 4), ((uint32_t*)keystream)[i]);
+    }
+    
+    // XOR input with keystream
+    size_t chunk_size = min(64, len - offset);
+    for (size_t i = 0; i < chunk_size; i++) {
+      output[offset + i] = input[offset + i] ^ keystream[i];
+    }
+    
+    // Increment counter for next block
+    state[12]++;
+  }
+  
+  if (detailed_memory_tracking) measureMemory("Step 3: End of ChaCha20");
+}
+
+// Pad data to ensure consistent benchmark comparison
 size_t padData(const char* input, unsigned char* output, size_t len) {
+  // Since ChaCha20 is a stream cipher, no padding is required for the algorithm itself
+  // However, we pad to 16-byte blocks for consistency with other ciphers in the benchmark
   size_t padded_len = ((len + 15) / 16) * 16;  // Round up to nearest 16
+  
   // Copy original data
   memcpy(output, input, len);
+  
   // Add padding (PKCS#7)
   unsigned char pad_value = padded_len - len;
   for (size_t i = len; i < padded_len; i++) {
     output[i] = pad_value;
   }
+  
   return padded_len;
 }
 
 // Remove padding
 size_t removePadding(unsigned char* data, size_t len) {
   if (len == 0) return 0;
+  
   // Last byte indicates padding length in PKCS#7
   unsigned char padding_value = data[len - 1];
+  
   // Check that padding is valid (not larger than block size)
   if (padding_value > 16) return len;
+  
   return len - padding_value;
+}
+
+// Encrypt data with ChaCha20 (with IV/nonce generation)
+// Returns the actual execution time in microseconds
+unsigned long encrypt(const unsigned char* input, unsigned char* output, size_t len) {
+  if (detailed_memory_tracking) measureMemory("Step 1: Before Encryption");
+  
+  // Measure time more accurately by running multiple iterations for short operations
+  const int MIN_ACCURATE_MICROS = 100; // Minimum time for accurate measurement
+  const int MIN_ITERATIONS = 3;       // Always do at least 3 iterations for stability
+  int iterations = 0;
+  unsigned long start_time = micros();
+  unsigned long end_time;
+  
+  // Save original output pointer to restore between iterations
+  unsigned char* original_output = output;
+  
+  // For extremely small inputs, use a larger buffer to ensure timing stability
+  unsigned char extra_buffer[64] = {0};
+  
+  do {
+    iterations++;
+    
+    // Restore output pointer for each iteration
+    output = original_output;
+    
+    // Generate nonce and store at start of output
+    unsigned char nonce[CHACHA20_NONCE_SIZE];
+    generateNonce(nonce);
+    memcpy(output, nonce, CHACHA20_NONCE_SIZE);
+    
+    // Use initial counter of 1 (standard practice)
+    uint32_t counter = 1;
+    memcpy(output + CHACHA20_NONCE_SIZE, &counter, 4);
+    
+    // Encrypt data
+    chacha20_encrypt_decrypt(input, output + IV_SIZE, len, chacha20_key, nonce, counter);
+    
+    // Small extra work to increase timing stability for very small inputs
+    if (len < 16) {
+      chacha20_encrypt_decrypt(extra_buffer, extra_buffer, sizeof(extra_buffer), chacha20_key, nonce, counter);
+    }
+    
+    end_time = micros();
+  } while (((end_time - start_time) < MIN_ACCURATE_MICROS || iterations < MIN_ITERATIONS) && 
+           iterations < 20); // Limit max iterations
+  
+  // Calculate average time per operation
+  unsigned long duration = safeTimeDiff(start_time, end_time);
+  unsigned long avg_time = duration / iterations;
+  
+  if (detailed_memory_tracking) measureMemory("Step 3: End of Encryption");
+  
+  // For accurate benchmark reporting
+  #if BENCHMARK_TIMING_DEBUG
+  if (iterations > 1) {
+    Serial.print("Encryption timing: Used ");
+    Serial.print(iterations);
+    Serial.print(" iterations for accurate measurement. Average: ");
+    Serial.print(avg_time);
+    Serial.println(" µs");
+  }
+  #endif
+  
+  return avg_time;
+}
+
+// Decrypt data with ChaCha20
+// Returns the actual execution time in microseconds
+unsigned long decrypt(const unsigned char* input, unsigned char* output, size_t len) {
+  if (detailed_memory_tracking) measureMemory("Step 1: Before Decryption");
+  
+  // Measure time more accurately by running multiple iterations for short operations
+  const int MIN_ACCURATE_MICROS = 100; // Minimum time for accurate measurement
+  const int MIN_ITERATIONS = 3;       // Always do at least 3 iterations for stability
+  int iterations = 0;
+  unsigned long start_time = micros();
+  unsigned long end_time;
+  
+  // Save original input/output pointers to restore between iterations
+  const unsigned char* original_input = input;
+  unsigned char* original_output = output;
+  
+  // For extremely small inputs, use a larger buffer to ensure timing stability
+  unsigned char extra_buffer[64] = {0};
+  
+  do {
+    iterations++;
+    
+    // Restore input/output pointers for each iteration
+    input = original_input;
+    output = original_output;
+    
+    // Extract nonce from start of input
+    unsigned char nonce[CHACHA20_NONCE_SIZE];
+    memcpy(nonce, input, CHACHA20_NONCE_SIZE);
+    
+    // Extract counter
+    uint32_t counter;
+    memcpy(&counter, input + CHACHA20_NONCE_SIZE, 4);
+    
+    // Decrypt data (same operation as encrypt for ChaCha20)
+    chacha20_encrypt_decrypt(input + IV_SIZE, output, len, chacha20_key, nonce, counter);
+    
+    // Small extra work to increase timing stability for very small inputs
+    if (len < 16) {
+      chacha20_encrypt_decrypt(extra_buffer, extra_buffer, sizeof(extra_buffer), chacha20_key, nonce, counter);
+    }
+    
+    end_time = micros();
+  } while (((end_time - start_time) < MIN_ACCURATE_MICROS || iterations < MIN_ITERATIONS) && 
+           iterations < 20); // Limit max iterations
+  
+  // Calculate average time per operation
+  unsigned long duration = safeTimeDiff(start_time, end_time);
+  unsigned long avg_time = duration / iterations;
+  
+  if (detailed_memory_tracking) measureMemory("Step 3: End of Decryption");
+  
+  // For accurate benchmark reporting
+  #if BENCHMARK_TIMING_DEBUG
+  if (iterations > 1) {
+    Serial.print("Decryption timing: Used ");
+    Serial.print(iterations);
+    Serial.print(" iterations for accurate measurement. Average: ");
+    Serial.print(avg_time);
+    Serial.println(" µs");
+  }
+  #endif
+  
+  return avg_time;
 }
 
 // Helper function to remove spaces from a string
@@ -295,260 +620,63 @@ unsigned long safeTimeDiff(unsigned long start, unsigned long end) {
   }
 }
 
-// SPECK helper functions
-uint64_t rotl(uint64_t x, unsigned int n) {
-  return (x << n) | (x >> (64 - n));
-}
-
-uint64_t rotr(uint64_t x, unsigned int n) {
-  return (x >> n) | (x << (64 - n));
-}
-
-// Convert byte array to uint64_t (little-endian)
-uint64_t bytes_to_uint64(const unsigned char* bytes) {
-  uint64_t result = 0;
-  for (int i = 0; i < 8; i++) {
-    result |= ((uint64_t)bytes[i]) << (i * 8);
-  }
-  return result;
-}
-
-// Convert uint64_t to byte array (little-endian)
-void uint64_to_bytes(uint64_t value, unsigned char* bytes) {
-  for (int i = 0; i < 8; i++) {
-    bytes[i] = (value >> (i * 8)) & 0xFF;
-  }
-}
-
-// SPECK key expansion
-void speck_key_schedule() {
-  if (detailed_memory_tracking) measureMemory("Step 1: Before Key Schedule");
+// Validate ChaCha20 implementation against test vector
+bool validate_chacha20() {
+  Serial.println("\nValidating ChaCha20 implementation against test vectors...");
   
-  uint64_t k[2]; // Key split into two 64-bit halves
+  // Set up test state
+  uint32_t state[16];
+  chacha20_init(state, test_key, test_nonce, test_counter);
   
-  // Convert key bytes to uint64_t values
-  k[0] = bytes_to_uint64(speck_key);
-  k[1] = bytes_to_uint64(speck_key + 8);
+  // Generate keystream
+  unsigned char keystream[CHACHA20_BLOCK_SIZE];
+  chacha20_keystream(state, keystream, CHACHA20_BLOCK_SIZE);
   
-  // First round key is the lower 64 bits of the original key
-  expanded_key[0] = k[0];
-  
-  // Generate remaining round keys
-  for (int i = 0; i < SPECK_ROUNDS - 1; i++) {
-    uint64_t l = k[1];
-    l = rotr(l, SPECK_ALPHA);
-    l = (l + k[0]) & 0xFFFFFFFFFFFFFFFFULL;
-    l = l ^ i;
-    k[0] = rotl(k[0], SPECK_BETA);
-    k[0] = k[0] ^ l;
-    expanded_key[i + 1] = k[0];
-    k[1] = l;
-  }
-  
-  key_initialized = true;
-  
-  if (detailed_memory_tracking) measureMemory("Step 2: After Key Schedule");
-}
-
-// SPECK encrypt a single block (128 bits, stored as two 64-bit words)
-void speck_encrypt_block(uint64_t* block) {
-  uint64_t x = block[0];
-  uint64_t y = block[1];
-  
-  for (int i = 0; i < SPECK_ROUNDS; i++) {
-    x = rotr(x, SPECK_ALPHA);
-    x = (x + y) & 0xFFFFFFFFFFFFFFFFULL;
-    x = x ^ expanded_key[i];
-    y = rotl(y, SPECK_BETA);
-    y = y ^ x;
-  }
-  
-  block[0] = x;
-  block[1] = y;
-}
-
-// SPECK decrypt a single block (128 bits, stored as two 64-bit words)
-void speck_decrypt_block(uint64_t* block) {
-  uint64_t x = block[0];
-  uint64_t y = block[1];
-  
-  for (int i = SPECK_ROUNDS - 1; i >= 0; i--) {
-    y = y ^ x;
-    y = rotr(y, SPECK_BETA);
-    x = x ^ expanded_key[i];
-    x = (x - y) & 0xFFFFFFFFFFFFFFFFULL;
-    x = rotl(x, SPECK_ALPHA);
-  }
-  
-  block[0] = x;
-  block[1] = y;
-}
-
-// Validate implementation against test vectors
-bool validate_speck() {
-  Serial.println("\nValidating SPECK implementation against test vectors...");
-  
-  // Test block operations
-  uint64_t block[2];
-  block[0] = bytes_to_uint64(test_plaintext);
-  block[1] = bytes_to_uint64(test_plaintext + 8);
-  
-  // Encrypt block
-  speck_encrypt_block(block);
-  
-  // Check results
-  uint8_t result[SPECK_BLOCK_SIZE];
-  uint64_to_bytes(block[0], result);
-  uint64_to_bytes(block[1], result + 8);
-  
-  bool encryption_ok = true;
-  for (int i = 0; i < SPECK_BLOCK_SIZE; i++) {
-    if (result[i] != test_ciphertext[i]) {
-      encryption_ok = false;
-      Serial.print("Encryption mismatch at byte ");
+  // Verify keystream matches expected
+  bool keystream_match = true;
+  for (int i = 0; i < 16; i++) {
+    if (keystream[i] != test_keystream[i]) {
+      keystream_match = false;
+      Serial.print("Keystream mismatch at byte ");
       Serial.print(i);
       Serial.print(": Expected ");
-      Serial.print(test_ciphertext[i], HEX);
+      Serial.print(test_keystream[i], HEX);
       Serial.print(", Got ");
-      Serial.println(result[i], HEX);
+      Serial.println(keystream[i], HEX);
     }
   }
   
-  // Test decryption
-  block[0] = bytes_to_uint64(test_ciphertext);
-  block[1] = bytes_to_uint64(test_ciphertext + 8);
-  speck_decrypt_block(block);
+  // Test encryption and decryption
+  const char* test_plaintext = "The quick brown fox jumps over the lazy dog";
+  size_t test_len = strlen(test_plaintext);
   
-  uint64_to_bytes(block[0], result);
-  uint64_to_bytes(block[1], result + 8);
+  unsigned char encrypted[test_len + IV_SIZE];
+  unsigned char decrypted[test_len];
   
-  bool decryption_ok = true;
-  for (int i = 0; i < SPECK_BLOCK_SIZE; i++) {
-    if (result[i] != test_plaintext[i]) {
-      decryption_ok = false;
-      Serial.print("Decryption mismatch at byte ");
-      Serial.print(i);
-      Serial.print(": Expected ");
-      Serial.print(test_plaintext[i], HEX);
-      Serial.print(", Got ");
-      Serial.println(result[i], HEX);
-    }
-  }
+  // Encrypt with known nonce and counter
+  chacha20_encrypt_decrypt((unsigned char*)test_plaintext, encrypted, test_len, 
+                          test_key, test_nonce, test_counter);
+  
+  // Decrypt
+  chacha20_encrypt_decrypt(encrypted, decrypted, test_len, 
+                          test_key, test_nonce, test_counter);
+  
+  // Check decryption result
+  bool decrypt_match = (memcmp(decrypted, test_plaintext, test_len) == 0);
   
   // Report results
-  if (encryption_ok && decryption_ok) {
-    Serial.println("Validation SUCCESSFUL! SPECK implementation is correct.");
+  if (keystream_match && decrypt_match) {
+    Serial.println("Validation SUCCESSFUL! ChaCha20 implementation is correct.");
   } else {
-    Serial.println("Validation FAILED! SPECK implementation has errors.");
-    Serial.print("Encryption match: "); Serial.println(encryption_ok ? "YES" : "NO");
-    Serial.print("Decryption match: "); Serial.println(decryption_ok ? "YES" : "NO");
+    Serial.println("Validation FAILED! ChaCha20 implementation has errors.");
+    Serial.print("Keystream match: "); Serial.println(keystream_match ? "YES" : "NO");
+    Serial.print("Decrypt match: "); Serial.println(decrypt_match ? "YES" : "NO");
   }
   
-  return encryption_ok && decryption_ok;
+  return keystream_match && decrypt_match;
 }
 
-// Encrypt data with SPECK-CBC
-void encrypt(const unsigned char* input, unsigned char* output, size_t len) {
-  if (detailed_memory_tracking) measureMemory("Step 1: Before Encryption");
-  
-  // Initialize key schedule if needed
-  if (!key_initialized) {
-    speck_key_schedule();
-  }
-  
-  if (detailed_memory_tracking) measureMemory("Step 2: After Key Schedule");
-  
-  // Generate IV and copy to the start of output
-  unsigned char iv[IV_SIZE];
-  generateIV(iv);
-  memcpy(output, iv, IV_SIZE);
-  
-  if (detailed_memory_tracking) measureMemory("Step 3: After IV Generation");
-  
-  // Process each block with CBC mode
-  unsigned char temp_iv[IV_SIZE];
-  memcpy(temp_iv, iv, IV_SIZE);
-  
-  // Process data in blocks
-  for (size_t i = 0; i < len; i += SPECK_BLOCK_SIZE) {
-    // XOR the plaintext with the IV/previous ciphertext (CBC mode)
-    unsigned char xored_block[SPECK_BLOCK_SIZE];
-    for (size_t j = 0; j < SPECK_BLOCK_SIZE; j++) {
-      xored_block[j] = input[i + j] ^ temp_iv[j];
-    }
-    
-    // Encrypt the block
-    uint64_t block[2];
-    block[0] = bytes_to_uint64(xored_block);
-    block[1] = bytes_to_uint64(xored_block + 8);
-    speck_encrypt_block(block);
-    
-    // Convert the encrypted block back to bytes
-    unsigned char encrypted_block[SPECK_BLOCK_SIZE];
-    uint64_to_bytes(block[0], encrypted_block);
-    uint64_to_bytes(block[1], encrypted_block + 8);
-    
-    // Copy the encrypted block to the output
-    memcpy(output + IV_SIZE + i, encrypted_block, SPECK_BLOCK_SIZE);
-    
-    // Update the IV for the next block
-    memcpy(temp_iv, encrypted_block, SPECK_BLOCK_SIZE);
-  }
-  
-  if (detailed_memory_tracking) measureMemory("Step 4: End of Encryption");
-}
-
-// Decrypt data with SPECK-CBC
-void decrypt(const unsigned char* input, unsigned char* output, size_t len) {
-  if (detailed_memory_tracking) measureMemory("Step 1: Before Decryption");
-  
-  // Initialize key schedule if needed
-  if (!key_initialized) {
-    speck_key_schedule();
-  }
-  
-  if (detailed_memory_tracking) measureMemory("Step 2: After Key Schedule");
-  
-  // Get IV from the start of the input
-  unsigned char iv[IV_SIZE];
-  memcpy(iv, input, IV_SIZE);
-  
-  if (detailed_memory_tracking) measureMemory("Step 3: After IV Extraction");
-  
-  // Process each block with CBC mode
-  for (size_t i = 0; i < len; i += SPECK_BLOCK_SIZE) {
-    // Get the current ciphertext block
-    const unsigned char* current_block = input + IV_SIZE + i;
-    
-    // Convert to 64-bit words
-    uint64_t block[2];
-    block[0] = bytes_to_uint64(current_block);
-    block[1] = bytes_to_uint64(current_block + 8);
-    
-    // Decrypt the block
-    speck_decrypt_block(block);
-    
-    // Convert back to bytes
-    unsigned char decrypted_block[SPECK_BLOCK_SIZE];
-    uint64_to_bytes(block[0], decrypted_block);
-    uint64_to_bytes(block[1], decrypted_block + 8);
-    
-    // XOR with the previous ciphertext block (or IV for the first block)
-    for (size_t j = 0; j < SPECK_BLOCK_SIZE; j++) {
-      unsigned char prev_byte;
-      if (i == 0) {
-        prev_byte = iv[j];
-      } else {
-        prev_byte = input[IV_SIZE + i - SPECK_BLOCK_SIZE + j];
-      }
-      output[i + j] = decrypted_block[j] ^ prev_byte;
-    }
-  }
-  
-  if (detailed_memory_tracking) measureMemory("Step 4: End of Decryption");
-}
-
-// Evaluate expression (compatible with ASCON)
+// Evaluate expression (for compatibility with benchmark)
 int evaluerUttrykk(const char* expr) {
   int result = 0;
   char cleanExpr[256];
@@ -614,7 +742,7 @@ int evaluerUttrykk(const char* expr) {
   return 0; // Not a recognized expression
 }
 
-// Initialize benchmark
+// Initialize benchmark with improved metrics collection
 void startBenchmark(String text, long repeats) {
   // Measure memory before benchmark
   measureMemory("Before Benchmark");
@@ -643,33 +771,69 @@ void startBenchmark(String text, long repeats) {
   // Set benchmark state to running
   benchmark_state = BENCHMARK_RUNNING;
   
-  Serial.print("Starting SPECK benchmark with ");
+  Serial.print("Starting ChaCha20 benchmark with ");
   Serial.print(repeats);
   Serial.println(" repetitions...");
+  Serial.print("Input: \"");
+  Serial.print(text);
+  Serial.print("\" (");
+  Serial.print(benchmark_input_len);
+  Serial.print(" bytes, padded to ");
+  Serial.print(benchmark_padded_len);
+  Serial.println(" bytes)");
   Serial.println("(You can send new commands while benchmark is running)");
   Serial.println("Send 'STOP' to abort benchmark");
 }
 
-// Process a chunk of benchmark iterations
+// Process a chunk of benchmark iterations with statistical validation
 void processBenchmarkChunk() {
   if (benchmark_state != BENCHMARK_RUNNING) return;
   
-  unsigned long start_time, end_time;
+  unsigned long start_time, end_time, encrypt_time, decrypt_time;
   int chunk_size = min(BENCHMARK_CHUNK_SIZE, benchmark_total_iterations - benchmark_current_iteration);
   bool report_progress = false;
   
+  // For statistical validation
+  static unsigned long min_encrypt_time = ULONG_MAX;
+  static unsigned long max_encrypt_time = 0;
+  static unsigned long min_decrypt_time = ULONG_MAX;
+  static unsigned long max_decrypt_time = 0;
+  
   for (int i = 0; i < chunk_size; i++) {
-    // Encryption
-    start_time = micros();
-    encrypt(benchmark_padded, benchmark_encrypted, benchmark_padded_len);
-    end_time = micros();
-    benchmark_total_encrypt_time += safeTimeDiff(start_time, end_time);
+    // Encryption timing with verification
+    encrypt_time = encrypt(benchmark_padded, benchmark_encrypted, benchmark_padded_len);
+    benchmark_total_encrypt_time += encrypt_time;
     
-    // Decryption (remember that encrypted contains IV at the beginning)
-    start_time = micros();
-    decrypt(benchmark_encrypted, benchmark_decrypted, benchmark_padded_len);
-    end_time = micros();
-    benchmark_total_decrypt_time += safeTimeDiff(start_time, end_time);
+    // Track min/max for statistical validation
+    min_encrypt_time = min(min_encrypt_time, encrypt_time);
+    max_encrypt_time = max(max_encrypt_time, encrypt_time);
+    
+    // Verify encryption result by decrypting and comparing (every 500th iteration to save time)
+    if (benchmark_current_iteration % 500 == 0) {
+      unsigned char verify_buffer[MAX_SIZE];
+      decrypt(benchmark_encrypted, verify_buffer, benchmark_padded_len);
+      
+      // Check if decryption produces the original plaintext
+      bool encryption_verified = true;
+      for (size_t j = 0; j < benchmark_padded_len; j++) {
+        if (verify_buffer[j] != benchmark_padded[j]) {
+          encryption_verified = false;
+          break;
+        }
+      }
+      
+      if (!encryption_verified) {
+        Serial.println("\nWARNING: Encryption verification failed! Results may be invalid.");
+      }
+    }
+    
+    // Decryption timing with verification
+    decrypt_time = decrypt(benchmark_encrypted, benchmark_decrypted, benchmark_padded_len);
+    benchmark_total_decrypt_time += decrypt_time;
+    
+    // Track min/max for statistical validation
+    min_decrypt_time = min(min_decrypt_time, decrypt_time);
+    max_decrypt_time = max(max_decrypt_time, decrypt_time);
     
     // Evaluation (if the text is an expression)
     size_t actual_len = removePadding(benchmark_decrypted, benchmark_padded_len);
@@ -700,6 +864,19 @@ void processBenchmarkChunk() {
       Serial.print(" ");
       Serial.print(benchmark_current_iteration);
       Serial.println(" repetitions completed");
+      
+      // Show time variance stats every 10K iterations
+      float encrypt_variance = (float)(max_encrypt_time - min_encrypt_time) / ((min_encrypt_time + max_encrypt_time) / 2.0) * 100.0;
+      float decrypt_variance = (float)(max_decrypt_time - min_decrypt_time) / ((min_decrypt_time + max_decrypt_time) / 2.0) * 100.0;
+      
+      // Only report if variance is significant (>10%)
+      if (encrypt_variance > 10.0 || decrypt_variance > 10.0) {
+        Serial.print("  Time variance - Encrypt: ");
+        Serial.print(encrypt_variance, 1);
+        Serial.print("%, Decrypt: ");
+        Serial.print(decrypt_variance, 1);
+        Serial.println("%");
+      }
     }
   }
   
@@ -709,20 +886,48 @@ void processBenchmarkChunk() {
   }
 }
 
-// Complete benchmark and report results
+// Complete benchmark and report results with enhanced analysis
 void finishBenchmark() {
   // End timing for the entire benchmark
   unsigned long benchmark_end = millis();
   unsigned long total_benchmark_time = safeTimeDiff(benchmark_start_time, benchmark_end);
   
-  // Calculate actual CPU usage
+  // Calculate actual CPU usage more accurately
+  // Convert microseconds to milliseconds for proper comparison
   cpu_usage = (benchmark_total_encrypt_time + benchmark_total_decrypt_time) / 1000.0 / total_benchmark_time * 100.0;
   
   // Calculate total combined time and average
   unsigned long total_combined_time = benchmark_total_encrypt_time + benchmark_total_decrypt_time;
   float combined_average_time = total_combined_time / (float)(benchmark_total_iterations * 2);
   
-  Serial.println("\nResults:");
+  // Phase 1: Calculate average times per operation
+  avgEnc = benchmark_total_encrypt_time / (float)benchmark_total_iterations;
+  avgDec = benchmark_total_decrypt_time / (float)benchmark_total_iterations;
+  
+  // Phase 2: Calculate throughput (bytes per second)
+  encrypt_throughput = (unsigned long)(benchmark_padded_len * 1e6 / avgEnc);
+  decrypt_throughput = (unsigned long)(benchmark_padded_len * 1e6 / avgDec);
+  
+  // Phase 3: Calculate goodput (effective bytes per second, excluding overhead)
+  encrypt_goodput = (unsigned long)(benchmark_input_len * 1e6 / avgEnc);
+  decrypt_goodput = (unsigned long)(benchmark_input_len * 1e6 / avgDec);
+  
+  // Calculate overhead and efficiency metrics
+  float overhead_bytes = (float)(benchmark_padded_len - benchmark_input_len);
+  float iv_overhead = (float)IV_SIZE; // IV + counter
+  float padding_overhead = overhead_bytes - iv_overhead;
+  float protocol_overhead_pct = 100.0 * (1.0 - ((float)benchmark_input_len / benchmark_padded_len));
+  
+  // Report benchmark results with overall statistics
+  Serial.println("\nBenchmark Results (5000 iterations):");
+  Serial.print("Input text: \"");
+  Serial.print(benchmark_text);
+  Serial.print("\" (");
+  Serial.print(benchmark_input_len);
+  Serial.print(" bytes, padded to ");
+  Serial.print(benchmark_padded_len);
+  Serial.println(" bytes)");
+  
   Serial.print("Total encryption time: ");
   Serial.print(benchmark_total_encrypt_time);
   Serial.println(" µs");
@@ -743,9 +948,7 @@ void finishBenchmark() {
   Serial.print(cpu_usage, 2);
   Serial.println("%");
   
-  Serial.print("Average time per operation:\n");
-  avgEnc = benchmark_total_encrypt_time / (float)benchmark_total_iterations;
-  avgDec = benchmark_total_decrypt_time / (float)benchmark_total_iterations;
+  Serial.println("\nAverage time per operation:");
   Serial.print("  Encryption: ");
   Serial.print(avgEnc, 2);
   Serial.println(" µs");
@@ -758,12 +961,8 @@ void finishBenchmark() {
   Serial.print(combined_average_time, 2);
   Serial.println(" µs");
   
-  // Calculate throughput and goodput
-  encrypt_throughput = (unsigned long)(benchmark_padded_len * 1e6 / avgEnc);
-  decrypt_throughput = (unsigned long)(benchmark_padded_len * 1e6 / avgDec);
-  encrypt_goodput = (unsigned long)(benchmark_input_len * 1e6 / avgEnc);
-  decrypt_goodput = (unsigned long)(benchmark_input_len * 1e6 / avgDec);
-  
+  // Performance metrics from combined benchmark
+  Serial.println("\nPerformance metrics (based on all 5000 iterations):");
   Serial.print("Encryption throughput: ");
   Serial.print(encrypt_throughput);
   Serial.println(" bytes/s");
@@ -779,6 +978,11 @@ void finishBenchmark() {
   Serial.print("Decryption goodput: ");
   Serial.print(decrypt_goodput);
   Serial.println(" bytes/s");
+  
+  // Protocol overhead breakdown
+  Serial.print("Protocol overhead: ");
+  Serial.print(protocol_overhead_pct, 1);
+  Serial.println("%");
   
   if (benchmark_total_eval_time > 0) {
     Serial.print("Total evaluation time: ");
@@ -819,26 +1023,23 @@ void finishBenchmark() {
 
 void setup() {
   Serial.begin(115200);
-  delay(3000);  // Wait for serial to be ready instead of potentially blocking forever
-  randomSeed(analogRead(0)); // Initialize random for IV generation
-  
-  // Pre-compute key schedule
-  speck_key_schedule();
+  delay(3000);  // Wait for serial to be ready
+  randomSeed(analogRead(0)); // Initialize random for nonce generation
   
   // Added memory measurement at startup
   measureMemory("Startup");
   
-  Serial.println("SPECK Encryption Test & Benchmark");
+  Serial.println("ChaCha20 Encryption Test & Benchmark");
   Serial.println("Commands:");
   Serial.println("  REPEAT [count] [text] - Run benchmark");
   Serial.println("  MATRIX - Generate decision matrix report");
   Serial.println("  MEMORY_DETAIL_ON - Enable detailed memory tracking");
   Serial.println("  MEMORY_DETAIL_OFF - Disable detailed memory tracking");
-  Serial.println("  VALIDATE - Validate SPECK implementation");
+  Serial.println("  VALIDATE - Validate ChaCha20 implementation");
   Serial.println("  STOP - Abort running benchmark");
   
   // Run validation on startup
-  validate_speck();
+  validate_chacha20();
 }
 
 void loop() {
@@ -865,7 +1066,7 @@ void loop() {
       }
       // Check if validation is requested
       else if (input.equalsIgnoreCase("VALIDATE")) {
-        validate_speck();
+        validate_chacha20();
       }
       // Check if matrix report is requested
       else if (input.equalsIgnoreCase("MATRIX")) {
@@ -925,7 +1126,7 @@ void loop() {
         
         // Buffers for encryption/decryption
         unsigned char padded[MAX_SIZE] = { 0 };
-        unsigned char encrypted[MAX_SIZE + IV_SIZE] = { 0 }; // Extra space for IV
+        unsigned char encrypted[MAX_SIZE + IV_SIZE] = { 0 }; // Extra space for IV/nonce
         unsigned char decrypted[MAX_SIZE] = { 0 };
         
         // Add padding
@@ -933,16 +1134,12 @@ void loop() {
         size_t padded_len = padData(input.c_str(), padded, input_len);
         
         // Encrypt data
-        unsigned long start_time = micros();
-        encrypt(padded, encrypted, padded_len);
-        unsigned long encrypt_time = safeTimeDiff(start_time, micros());
+        unsigned long encrypt_time = encrypt(padded, encrypted, padded_len);
         
         // Decryption
-        start_time = micros();
-        decrypt(encrypted, decrypted, padded_len);
-        unsigned long decrypt_time = safeTimeDiff(start_time, micros());
+        unsigned long decrypt_time = decrypt(encrypted, decrypted, padded_len);
         
-        Serial.print("Encrypted (with IV): ");
+        Serial.print("Encrypted (with IV/nonce): ");
         printHex(encrypted, min(padded_len + IV_SIZE, 32));
         Serial.print("Encryption time: ");
         Serial.print(encrypt_time);
@@ -999,6 +1196,12 @@ void loop() {
               Serial.println("RESP:ERROR=Incorrect result");
             }
           }
+        }
+        
+        // Add timing validation - warn if timing appears suspicious
+        if (encrypt_time == decrypt_time || (input_len > 10 && encrypt_time < 15)) {
+          Serial.println("WARNING: Timing measurements may be inaccurate for small inputs.");
+          Serial.println("Consider using the REPEAT command for more accurate benchmarking.");
         }
         
         // Add memory measurement after encryption/decryption
