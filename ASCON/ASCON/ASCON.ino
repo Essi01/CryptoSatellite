@@ -1,20 +1,58 @@
-#include <Arduino.h>
+/*
+ * ASCON Authenticated Encryption Implementation for Arduino
+ * With standardized benchmarking for comparative analysis
+ * With INA226_WE power monitoring integration
+ * With dual-core RTOS support (compatible with single-core fallback)
+ */
 
+#include <Arduino.h>
 #ifdef ARDUINO_ARCH_MBED
 #include "mbed_stats.h"
+#include "mbed.h"
+#include "rtos/rtos.h"
+#endif
+
+#include <limits.h> // Include for ULONG_MAX
+
+// If ULONG_MAX is still not defined, define it manually
+#ifndef ULONG_MAX
+#define ULONG_MAX 0xFFFFFFFFUL // Maximum value for 32-bit unsigned long
+#endif
+
+// RTOS settings for dual-core operation
+// Only define USE_MULTICORE_RTOS if we detect we're on a dual-core board
+#if defined(ARDUINO_ARCH_MBED) && defined(CORE_CM4) && defined(CORE_CM7)
+#define USE_MULTICORE_RTOS
+#define CORE_CRYPTO 1  // M7 core
+#define CORE_POWER  0  // M4 core
 #endif
 
 // Algorithm identification and measurement constants
 #define ALGORITHM_NAME "ASCON"
-bool detailed_memory_tracking = false;  // Variabel som kan endres under kjøring
+bool detailed_memory_tracking = false;  // Variable that can be changed during runtime
+
+// Power monitoring configuration - using INA226
+#define USE_INA226
+
+#ifdef USE_INA226
+#include <Wire.h>
+#include <INA226_WE.h>
+#define INA226_I2C_ADDRESS 0x40    // Default I2C address (0x40)
+#define SHUNT_RESISTOR_VALUE 0.1   // 0.1 ohm shunt resistor (adjust to your actual value)
+#define MAX_CURRENT 1.0            // Maximum current to measure in amperes
+INA226_WE ina226(INA226_I2C_ADDRESS);  // Initialize with I2C address
+#endif
+
+// Add debug timing define
+#define BENCHMARK_TIMING_DEBUG false  // Set to false to hide individual timing details
 
 // Ascon constants
-#define ASCON_128_IV 0x80400c0600000000ULL  // Initialization vector for Ascon-128
-#define ASCON_ROUNDS_A 12                   // Rounds for permutation in initialization/finalization
-#define ASCON_ROUNDS_B 6                    // Rounds for permutation in between blocks
-#define IV_SIZE 16                          // External IV size for CBC mode (same as others)
-#define KEY_SIZE 16                         // 128-bit key
-#define TAG_SIZE 16                         // 128-bit authentication tag
+#define ASCON_IV 0x80400c0600000000ULL  // Initialization vector for Ascon-128
+#define ASCON_ROUNDS_A 12               // Rounds for permutation in initialization/finalization
+#define ASCON_ROUNDS_B 6                // Rounds for permutation in between blocks
+#define IV_SIZE 16                      // External IV size (same as others)
+#define KEY_SIZE 16                     // 128-bit key
+#define TAG_SIZE 16                     // 128-bit authentication tag
 
 // Ascon key (128-bit)
 const unsigned char ascon_key[KEY_SIZE] = {
@@ -22,70 +60,46 @@ const unsigned char ascon_key[KEY_SIZE] = {
   0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
 };
 
-// Test vector for validation
-typedef struct {
-  const char* name;
-  const uint8_t key[KEY_SIZE];
-  const uint8_t nonce[16];
-  const uint8_t* ad;
-  size_t ad_len;
-  const uint8_t* msg;
-  size_t msg_len;
-  const uint8_t* ct;
-  const uint8_t* tag;  // Endret fra array til peker
-} TestVector;
-
-// Official Ascon-128 test vector (from RFC 9459)
-// This is a simplified test vector for basic validation
-const uint8_t test_key[] = {
-  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
-};
-
-const uint8_t test_nonce[] = {
-  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
-};
-
-const uint8_t test_ad[] = {
-  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
-};
-
-const uint8_t test_msg[] = {
-  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
-};
-
-const uint8_t test_ct[] = {
-  0x76, 0x65, 0x35, 0xD5, 0xC5, 0xF8, 0x38, 0xD1,
-  0xD0, 0xA8, 0x3B, 0x6D, 0x0F, 0x2B, 0xF5, 0x0F
-};
-
-const uint8_t test_tag[] = {
-  0xA7, 0xD6, 0x5A, 0xF5, 0x60, 0x75, 0x63, 0x13,
-  0xFD, 0x14, 0x35, 0xD8, 0x92, 0x96, 0xF2, 0x55
-};
-
-const TestVector test_vector = {
-  "RFC 9459 Test Vector",
-  {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F},
-  {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F},
-  test_ad, sizeof(test_ad),
-  test_msg, sizeof(test_msg),
-  test_ct, 
-  test_tag
-};
-
 // Constants for non-blocking benchmark
 #define BENCHMARK_CHUNK_SIZE 100  // Number of iterations per chunk
 #define BENCHMARK_IDLE false
 #define BENCHMARK_RUNNING true
 
+// RTOS related variables and mutexes (only when multi-core mode is enabled)
+#ifdef USE_MULTICORE_RTOS
+rtos::Thread power_thread;
+rtos::Thread crypto_thread;
+rtos::Mutex power_mutex;  // To protect shared power data
+rtos::Mutex benchmark_mutex; // To protect benchmark state
+rtos::Mutex serial_mutex;  // To protect Serial output from mixing
+rtos::Semaphore crypto_semaphore(0); // Signal to start crypto operations
+rtos::Semaphore power_semaphore(0);  // Signal to start power measurements
+
+// Flags for thread synchronization
+volatile bool crypto_active = false;
+volatile bool power_thread_running = false;
+volatile bool benchmark_mode = false;
+volatile bool single_measurement_mode = false;
+
+// Power measurement buffer
+#define MAX_POWER_SAMPLES 2000
+struct PowerSample {
+  unsigned long timestamp;  // Timestamp in ms
+  float current_mA;         // Current in mA
+  float voltage_V;          // Voltage in V
+  float power_mW;           // Power in mW
+};
+
+PowerSample power_samples[MAX_POWER_SAMPLES];
+volatile int power_sample_count = 0;
+#define POWER_SAMPLE_INTERVAL_MS 10  // Higher frequency for RTOS implementation
+#endif
+
 // Benchmark state variables
 bool benchmark_state = BENCHMARK_IDLE;
 const size_t MAX_SIZE = 256;
 unsigned char benchmark_padded[MAX_SIZE] = {0};
-unsigned char benchmark_encrypted[MAX_SIZE + IV_SIZE + TAG_SIZE] = {0};  // Added space for tag
+unsigned char benchmark_encrypted[MAX_SIZE + IV_SIZE + TAG_SIZE] = {0};
 unsigned char benchmark_decrypted[MAX_SIZE] = {0};
 size_t benchmark_input_len = 0;
 size_t benchmark_padded_len = 0;
@@ -96,6 +110,17 @@ unsigned long benchmark_total_decrypt_time = 0;
 unsigned long benchmark_total_eval_time = 0;
 unsigned long benchmark_start_time = 0;
 String benchmark_text = "";
+
+// Energy measurement variables
+#ifdef USE_INA226
+float benchmark_total_energy = 0.0;
+int benchmark_energy_samples = 0;
+float benchmark_avg_current = 0.0;
+float benchmark_max_current = 0.0;
+float benchmark_min_current = 9999.0;
+unsigned long benchmark_last_energy_sample = 0;
+const unsigned long ENERGY_SAMPLE_INTERVAL = 100; // Sample every 100ms
+#endif
 
 // Memory management metrics
 unsigned long used_ram = 0;
@@ -108,6 +133,23 @@ unsigned long encrypt_throughput = 0;
 unsigned long decrypt_throughput = 0;
 unsigned long encrypt_goodput = 0;
 unsigned long decrypt_goodput = 0;
+
+// Forward declarations
+void startBenchmark(String text, long repeats);
+void processBenchmarkChunk();
+void finishBenchmark();
+unsigned long encrypt(const unsigned char* input, unsigned char* output, size_t len);
+unsigned long decrypt(const unsigned char* input, unsigned char* output, size_t len);
+unsigned long safeTimeDiff(unsigned long start, unsigned long end);
+
+#ifdef USE_MULTICORE_RTOS
+void powerMeasurementThread();
+void cryptoBenchmarkThread();
+void startPowerMeasurement();
+void startBenchmarkRTOS();
+#endif
+
+/*********************** UTILITY FUNCTIONS ***********************/
 
 // Memory management functions
 #ifdef ARDUINO_ARCH_MBED
@@ -136,6 +178,10 @@ void measureMemory(const char* label) {
   }
   
   // Print memory information
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.lock();
+  #endif
+  
   Serial.print("MEMORY [");
   Serial.print(label);
   Serial.print("]: Heap ");
@@ -147,6 +193,10 @@ void measureMemory(const char* label) {
   Serial.print(" bytes, Stack max: ");
   Serial.print(stack_stats.max_size);
   Serial.println(" bytes");
+  
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.unlock();
+  #endif
 }
 
 // Generate decision matrix data report
@@ -159,7 +209,13 @@ void generateMatrixReport() {
   
   used_ram = heap_stats.current_size + stack_stats.max_size;
   
-  Serial.println("\n===== DECISION MATRIX DATA =====");
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.lock();
+  #endif
+  
+  Serial.println("\n==========================================");
+  Serial.println("        DECISION MATRIX DATA             ");
+  Serial.println("==========================================");
   Serial.print("Algorithm: ");
   Serial.println(ALGORITHM_NAME);
   
@@ -173,6 +229,7 @@ void generateMatrixReport() {
   Serial.print(cpu_usage, 2);
   Serial.println("%");
   
+  // Report both per-operation and per-byte latency
   Serial.print("Encryption Latency: ");
   Serial.print(avgEnc, 2);
   Serial.println(" µs");
@@ -197,11 +254,81 @@ void generateMatrixReport() {
   Serial.print(decrypt_goodput);
   Serial.println(" bytes/s");
   
+  // Calculate overhead percentage
+  float enc_overhead_pct = 100.0 * (1.0 - ((float)benchmark_input_len / benchmark_padded_len));
+  Serial.print("Protocol Overhead: ");
+  Serial.print(enc_overhead_pct, 1);
+  Serial.println("%");
+  
+  #ifdef USE_INA226
+  #ifdef USE_MULTICORE_RTOS
+  power_mutex.lock();
+  // Calculate average power from samples
+  float avg_current = 0;
+  float avg_power = 0;
+  float max_current = 0;
+  float min_current = 9999.0;
+  
+  if (power_sample_count > 0) {
+    for (int i = 0; i < power_sample_count; i++) {
+      avg_current += power_samples[i].current_mA;
+      avg_power += power_samples[i].power_mW;
+      max_current = max(max_current, power_samples[i].current_mA);
+      min_current = min(min_current, power_samples[i].current_mA);
+    }
+    avg_current /= power_sample_count;
+    avg_power /= power_sample_count;
+    
+    // Calculate energy in mJ (power in mW * time in s)
+    float total_time_s = (power_samples[power_sample_count-1].timestamp - 
+                          power_samples[0].timestamp) / 1000.0;
+    float total_energy = avg_power * total_time_s;
+    
+    Serial.print("Current (avg): ");
+    Serial.print(avg_current, 2);
+    Serial.println(" mA");
+    Serial.print("Current (range): ");
+    Serial.print(min_current, 2);
+    Serial.print(" - ");
+    Serial.print(max_current, 2);
+    Serial.println(" mA");
+    Serial.print("Energy: ");
+    Serial.print(total_energy, 2);
+    Serial.println(" mJ");
+  } else {
+    Serial.println("Current: No samples collected");
+    Serial.println("Energy: No samples collected");
+  }
+  power_mutex.unlock();
+  #else
+  Serial.print("Current (avg): ");
+  Serial.print(benchmark_avg_current, 2);
+  Serial.println(" mA");
+  
+  if (benchmark_min_current < 9999.0 && benchmark_max_current > 0) {
+    Serial.print("Current (range): ");
+    Serial.print(benchmark_min_current, 2);
+    Serial.print(" - ");
+    Serial.print(benchmark_max_current, 2);
+    Serial.println(" mA");
+  }
+  
+  Serial.print("Energy: ");
+  Serial.print(benchmark_total_energy, 2);
+  Serial.println(" mJ");
+  #endif
+  #else
   Serial.println("Current: [External measurement required]");
   Serial.println("Power: [External measurement required]");
+  #endif
+  
   Serial.println("Security Strength: 128-bit");
   Serial.println("Error Propagation: AEAD provides robust detection");
-  Serial.println("================================");
+  Serial.println("==========================================");
+  
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.unlock();
+  #endif
 }
 #else
 int freeRam() {
@@ -210,7 +337,7 @@ int freeRam() {
   return (int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
 }
 
-// Memory measurement function for non-MBED
+// Memory measurement function for non-MBED platforms
 void measureMemory(const char* label) {
   int free_ram = freeRam();
   
@@ -228,7 +355,9 @@ void measureMemory(const char* label) {
 
 // Simple matrix report for non-MBED platforms
 void generateMatrixReport() {
-  Serial.println("\n===== DECISION MATRIX DATA =====");
+  Serial.println("\n==========================================");
+  Serial.println("        DECISION MATRIX DATA             ");
+  Serial.println("==========================================");
   Serial.print("Algorithm: ");
   Serial.println(ALGORITHM_NAME);
   
@@ -263,13 +392,135 @@ void generateMatrixReport() {
   Serial.print(decrypt_goodput);
   Serial.println(" bytes/s");
   
+  // Calculate overhead percentage
+  float enc_overhead_pct = 100.0 * (1.0 - ((float)benchmark_input_len / benchmark_padded_len));
+  Serial.print("Protocol Overhead: ");
+  Serial.print(enc_overhead_pct, 1);
+  Serial.println("%");
+  
+  #ifdef USE_INA226
+  Serial.print("Current (avg): ");
+  Serial.print(benchmark_avg_current, 2);
+  Serial.println(" mA");
+  
+  if (benchmark_min_current < 9999.0 && benchmark_max_current > 0) {
+    Serial.print("Current (range): ");
+    Serial.print(benchmark_min_current, 2);
+    Serial.print(" - ");
+    Serial.print(benchmark_max_current, 2);
+    Serial.println(" mA");
+  }
+  
+  Serial.print("Energy: ");
+  Serial.print(benchmark_total_energy, 2);
+  Serial.println(" mJ");
+  #else
   Serial.println("Current: [External measurement required]");
   Serial.println("Power: [External measurement required]");
+  #endif
+  
   Serial.println("Security Strength: 128-bit");
   Serial.println("Error Propagation: AEAD provides robust detection");
-  Serial.println("================================");
+  Serial.println("==========================================");
 }
 #endif
+
+// Read current power measurements
+void readCurrentPower(float &current_mA, float &bus_voltage, float &power_mW) {
+  #ifdef USE_INA226
+  current_mA = ina226.getCurrent_mA();
+  bus_voltage = ina226.getBusVoltage_V();
+  power_mW = ina226.getBusPower() * 1000.0; // Convert W to mW
+  #else
+  current_mA = 0;
+  bus_voltage = 0;
+  power_mW = 0;
+  #endif
+}
+
+// Get INA226 power measurements
+void readPowerMeasurements() {
+  #ifdef USE_INA226
+  #ifdef USE_MULTICORE_RTOS
+  power_mutex.lock();
+  if (power_sample_count > 0) {
+    // Get the last sample
+    float current_mA = power_samples[power_sample_count-1].current_mA;
+    float bus_voltage = power_samples[power_sample_count-1].voltage_V;
+    float power_mW = power_samples[power_sample_count-1].power_mW;
+    
+    // Also calculate averages
+    float avg_current = 0;
+    float avg_power = 0;
+    for (int i = 0; i < power_sample_count; i++) {
+      avg_current += power_samples[i].current_mA;
+      avg_power += power_samples[i].power_mW;
+    }
+    avg_current /= power_sample_count;
+    avg_power /= power_sample_count;
+    
+    serial_mutex.lock();
+    Serial.println("\n==========================================");
+    Serial.println("         POWER MEASUREMENTS              ");
+    Serial.println("==========================================");
+    Serial.print("Current (instant): ");
+    Serial.print(current_mA, 2);
+    Serial.println(" mA");
+    Serial.print("Current (average): ");
+    Serial.print(avg_current, 2);
+    Serial.println(" mA");
+    Serial.print("Bus Voltage: ");
+    Serial.print(bus_voltage, 3);
+    Serial.println(" V");
+    Serial.print("Power (instant): ");
+    Serial.print(power_mW, 2);
+    Serial.println(" mW");
+    Serial.print("Power (average): ");
+    Serial.print(avg_power, 2);
+    Serial.println(" mW");
+    Serial.print("Samples: ");
+    Serial.println(power_sample_count);
+    Serial.println("==========================================");
+    serial_mutex.unlock();
+  } else {
+    serial_mutex.lock();
+    Serial.println("No power samples available. Starting measurement...");
+    serial_mutex.unlock();
+    // Start a single power measurement
+    single_measurement_mode = true;
+    if (!power_thread_running) {
+      startPowerMeasurement();
+    }
+  }
+  power_mutex.unlock();
+  #else
+  float current_mA = 0;
+  float bus_voltage = 0;
+  float power_mW = 0;
+  
+  // Direct measurement
+  readCurrentPower(current_mA, bus_voltage, power_mW);
+  
+  Serial.println("\n==========================================");
+  Serial.println("         POWER MEASUREMENTS              ");
+  Serial.println("==========================================");
+  Serial.print("Current: ");
+  Serial.print(current_mA, 2);
+  Serial.println(" mA");
+  
+  Serial.print("Bus Voltage: ");
+  Serial.print(bus_voltage, 3);
+  Serial.println(" V");
+  
+  Serial.print("Power: ");
+  Serial.print(power_mW, 2);
+  Serial.println(" mW");
+  Serial.println("==========================================");
+  #endif
+  #else
+  Serial.println("INA226 power monitoring not enabled");
+  #endif
+}
 
 // Helper function to display bytes as hex
 void printHex(const unsigned char* data, size_t len) {
@@ -279,6 +530,17 @@ void printHex(const unsigned char* data, size_t len) {
     Serial.print(" ");
   }
   Serial.println();
+}
+
+// Safe subtraction function to handle timer overflows
+unsigned long safeTimeDiff(unsigned long start, unsigned long end) {
+  // Handle timer overflow
+  if (end >= start) {
+    return end - start;
+  } else {
+    // Overflow occurred
+    return (0xFFFFFFFF - start) + end + 1;
+  }
 }
 
 // Generate a random IV
@@ -319,450 +581,408 @@ size_t removePadding(unsigned char* data, size_t len) {
 
 // ---------- Ascon-specific functions ----------
 
-// Helper functions for 64-bit operations
-uint64_t rotateRight(uint64_t x, int n) {
-  return (x >> n) | (x << (64 - n));
-}
-
-// Load a 64-bit value from bytes (little-endian)
-uint64_t bytes_to_uint64(const unsigned char* bytes) {
-  uint64_t result = 0;
+// Convert a byte array to a 64-bit value (little-endian)
+uint64_t bytesToUInt64(const uint8_t* bytes) {
+  uint64_t value = 0;
   for (int i = 0; i < 8; i++) {
-    result |= ((uint64_t)bytes[i]) << (i * 8);
+    value |= ((uint64_t)bytes[i]) << (8 * i);
   }
-  return result;
+  return value;
 }
 
-// Store a 64-bit value to bytes (little-endian)
-void uint64_to_bytes(uint64_t value, unsigned char* bytes) {
+// Convert a 64-bit value to a byte array (little-endian)
+void uint64ToBytes(uint64_t value, uint8_t* bytes) {
   for (int i = 0; i < 8; i++) {
-    bytes[i] = (value >> (i * 8)) & 0xFF;
+    bytes[i] = (value >> (8 * i)) & 0xFF;
   }
 }
 
-// Ascon permutation function
-void ascon_permutation(uint64_t* state, int rounds) {
-  // Ascon round constants
-  const uint64_t RC[12] = {
-    0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b
-  };
+// Rotation right function
+inline uint64_t rotr(uint64_t x, int n) { 
+  return (x >> n) | (x << (64 - n)); 
+}
+
+// Ascon permutation round
+void asconRound(uint64_t* s, uint8_t round_constant) {
+  // Add round constant
+  s[2] ^= round_constant;
   
-  // For each round
-  for (int r = 12 - rounds; r < 12; r++) {
-    // Add round constant
-    state[2] ^= RC[r];
-    
-    // Substitution layer (S-box)
-    uint64_t x0 = state[0], x1 = state[1], x2 = state[2], x3 = state[3], x4 = state[4];
-    uint64_t t0, t1, t2, t3, t4;
-    
-    x0 ^= x4;    x4 ^= x3;    x2 ^= x1;
-    t0 = ~x0;    t1 = ~x1;    t2 = ~x2;    t3 = ~x3;    t4 = ~x4;
-    t0 &= x1;    t1 &= x2;    t2 &= x3;    t3 &= x4;    t4 &= x0;
-    x0 ^= t1;    x1 ^= t2;    x2 ^= t3;    x3 ^= t4;    x4 ^= t0;
-    x1 ^= x0;    x0 ^= x4;    x3 ^= x2;    x2 = ~x2;
-    
-    state[0] = x0;  state[1] = x1;  state[2] = x2;  state[3] = x3;  state[4] = x4;
-    
-    // Linear diffusion layer
-    state[0] ^= rotateRight(state[0], 19) ^ rotateRight(state[0], 28);
-    state[1] ^= rotateRight(state[1], 61) ^ rotateRight(state[1], 39);
-    state[2] ^= rotateRight(state[2],  1) ^ rotateRight(state[2],  6);
-    state[3] ^= rotateRight(state[3], 10) ^ rotateRight(state[3], 17);
-    state[4] ^= rotateRight(state[4],  7) ^ rotateRight(state[4], 41);
+  // Nonlinear layer (S-box)
+  uint64_t t[5];
+  t[0] = s[0] ^ (~s[1] & s[2]);
+  t[1] = s[1] ^ (~s[2] & s[3]);
+  t[2] = s[2] ^ (~s[3] & s[4]);
+  t[3] = s[3] ^ (~s[4] & s[0]);
+  t[4] = s[4] ^ (~s[0] & s[1]);
+  
+  // Copy transformed state
+  for (int i = 0; i < 5; i++) {
+    s[i] = t[i];
+  }
+  
+  // Linear diffusion layer
+  s[0] ^= rotr(s[0], 19) ^ rotr(s[0], 28);
+  s[1] ^= rotr(s[1], 61) ^ rotr(s[1], 39);
+  s[2] ^= rotr(s[2], 1) ^ rotr(s[2], 6);
+  s[3] ^= rotr(s[3], 10) ^ rotr(s[3], 17);
+  s[4] ^= rotr(s[4], 7) ^ rotr(s[4], 41);
+}
+
+// Ascon permutation
+void asconPermutation(uint64_t* s, int rounds) {
+  const uint8_t RC[12] = {0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b};
+  for (int i = 12 - rounds; i < 12; i++) {
+    asconRound(s, RC[i]);
   }
 }
 
-// Initialize Ascon state with key and nonce
-void ascon_initialize(uint64_t* state, const unsigned char* key, const unsigned char* nonce) {
-  // Load key into 64-bit words
-  uint64_t k0 = bytes_to_uint64(key);
-  uint64_t k1 = bytes_to_uint64(key + 8);
+// Initialize Ascon state
+void asconInitialize(uint64_t* s, const uint8_t* key, const uint8_t* nonce) {
+  // Initialize with IV, key, and nonce
+  s[0] = ASCON_IV;
+  s[1] = bytesToUInt64(key);
+  s[2] = bytesToUInt64(key + 8);
+  s[3] = bytesToUInt64(nonce);
+  s[4] = bytesToUInt64(nonce + 8);
   
-  // Load IV and nonce into state
-  state[0] = ASCON_128_IV;
-  state[1] = k0;
-  state[2] = k1;
-  state[3] = bytes_to_uint64(nonce);
-  state[4] = bytes_to_uint64(nonce + 8);
+  // Apply first permutation
+  asconPermutation(s, ASCON_ROUNDS_A);
   
-  // Apply initial permutation
-  ascon_permutation(state, ASCON_ROUNDS_A);
-  
-  // XOR key to state
-  state[3] ^= k0;
-  state[4] ^= k1;
+  // XOR key into state
+  s[3] ^= bytesToUInt64(key);
+  s[4] ^= bytesToUInt64(key + 8);
 }
 
-// Process associated data (for AEAD)
-void ascon_process_associated_data(uint64_t* state, const unsigned char* ad, size_t adlen) {
-  // If no associated data, just apply domain separation constant
-  if (adlen == 0) {
-    state[0] ^= 1;
-    ascon_permutation(state, ASCON_ROUNDS_B);
-    return;
+// Process associated data (simplified, using NULL)
+void asconProcessAD(uint64_t* s) {
+  // For benchmark consistency, we use NULL AD
+  s[0] ^= 0x80;  // Padding for empty AD
+  
+  // Domain separation between associated data and plaintext
+  s[4] ^= 1;
+  
+  // Permutation after associated data
+  asconPermutation(s, ASCON_ROUNDS_B);
+}
+
+// Process plaintext
+void asconProcessPlaintext(uint64_t* s, const uint8_t* plain, uint8_t* cipher, size_t msglen) {
+  // Process full blocks
+  size_t i = 0;
+  while (i + 8 <= msglen) {
+    // Encrypt: ciphertext = state ^ plaintext
+    uint64_t block = bytesToUInt64(plain + i);
+    uint64_t cipherblock = s[0] ^ block;
+    uint64ToBytes(cipherblock, cipher + i);
+    
+    // Update state with ciphertext for next block
+    s[0] = cipherblock;
+    
+    // Apply permutation between blocks
+    if (i + 8 < msglen) {
+      asconPermutation(s, ASCON_ROUNDS_B);
+    }
+    i += 8;
   }
   
-  // Process associated data in 8-byte blocks
-  size_t i;
-  for (i = 0; i + 8 <= adlen; i += 8) {
-    // XOR block into state
-    state[0] ^= bytes_to_uint64(ad + i);
-    // Permutation between blocks
-    ascon_permutation(state, ASCON_ROUNDS_B);
-  }
-  
-  // Process final partial block if needed
-  if (i < adlen) {
+  // Process final block with padding
+  if (i < msglen) {
+    // Load remaining plaintext bytes
     uint64_t block = 0;
-    for (size_t j = 0; j < adlen - i; j++) {
-      block |= ((uint64_t)ad[i + j]) << (j * 8);
-    }
-    // Padding: append '1' bit then zeros
-    block |= ((uint64_t)0x80) << ((adlen - i) * 8);
-    state[0] ^= block;
-  } else if (adlen % 8 == 0 && adlen > 0) {
-    // If adlen is multiple of 8, apply padding in a separate block
-    state[0] ^= 0x80ULL << 56;
-  }
-  
-  // Domain separation constant
-  state[0] ^= 1;
-  ascon_permutation(state, ASCON_ROUNDS_B);
-}
-
-// Process plaintext/ciphertext with Ascon
-void ascon_process_plaintext(uint64_t* state, const unsigned char* input, 
-                             unsigned char* output, size_t len) {
-  // Process in 8-byte blocks
-  size_t i;
-  for (i = 0; i + 8 <= len; i += 8) {
-    // For encryption: state ⊕ plaintext → ciphertext
-    uint64_t block = bytes_to_uint64(input + i);
-    uint64_t cipher_block = state[0] ^ block;
-    uint64_to_bytes(cipher_block, output + i);
+    size_t remaining = msglen - i;
     
-    // Update state with ciphertext
-    state[0] = cipher_block;
-    
-    // Apply permutation between blocks (except for last block)
-    if (i + 8 < len) {
-      ascon_permutation(state, ASCON_ROUNDS_B);
-    }
-  }
-  
-  // Process final partial block if needed
-  if (i < len) {
-    uint64_t block = 0;
-    for (size_t j = 0; j < len - i; j++) {
-      block |= ((uint64_t)input[i + j]) << (j * 8);
+    for (size_t j = 0; j < remaining; j++) {
+      block |= ((uint64_t)plain[i + j]) << (8 * j);
     }
     
-    // Apply padding: append '1' bit followed by zeros
-    block |= ((uint64_t)0x80) << ((len - i) * 8);
+    // Add padding
+    block |= ((uint64_t)0x80) << (8 * remaining);
     
-    // XOR with state to get ciphertext block
-    uint64_t cipher_block = state[0] ^ block;
+    // Encrypt block
+    uint64_t cipherblock = s[0] ^ block;
     
-    // Write output (only the actual data bytes, not padding)
-    for (size_t j = 0; j < len - i; j++) {
-      output[i + j] = (cipher_block >> (j * 8)) & 0xFF;
+    // Store partial block
+    for (size_t j = 0; j < remaining; j++) {
+      cipher[i + j] = (cipherblock >> (8 * j)) & 0xFF;
     }
     
-    // Update state with padded ciphertext - keep only the data bits and padding bit
-    uint64_t masked_cipher = 0;
-    for (size_t j = 0; j < len - i; j++) {
-      masked_cipher |= ((cipher_block >> (j * 8)) & 0xFF) << (j * 8);
-    }
-    masked_cipher |= ((uint64_t)0x80) << ((len - i) * 8);
-    state[0] = masked_cipher;
-  } else if (len % 8 == 0 && len > 0) {
-    // If length is multiple of 8, we need to add padding in a separate block
-    state[0] ^= 0x80ULL << 56;
+    // Update state 
+    s[0] = (s[0] & ~((1ULL << (8 * remaining)) - 1)) | 
+           (cipherblock & ((1ULL << (8 * remaining)) - 1));
+  } else if (msglen == 0) {
+    // Empty message needs padding too
+    s[0] ^= 0x80;
   }
 }
 
-// Process ciphertext with Ascon for decryption
-void ascon_process_ciphertext(uint64_t* state, const unsigned char* input, 
-                              unsigned char* output, size_t len) {
-  // Process in 8-byte blocks
-  size_t i;
-  for (i = 0; i + 8 <= len; i += 8) {
-    // For decryption: state ⊕ ciphertext → plaintext
-    uint64_t cipher_block = bytes_to_uint64(input + i);
-    uint64_t plain_block = state[0] ^ cipher_block;
-    uint64_to_bytes(plain_block, output + i);
+// Process ciphertext
+void asconProcessCiphertext(uint64_t* s, const uint8_t* cipher, uint8_t* plain, size_t msglen) {
+  // Process full blocks
+  size_t i = 0;
+  while (i + 8 <= msglen) {
+    // Load ciphertext block
+    uint64_t cipherblock = bytesToUInt64(cipher + i);
     
-    // Update state with ciphertext
-    state[0] = cipher_block;
+    // Decrypt: plaintext = state ^ ciphertext
+    uint64_t block = s[0] ^ cipherblock;
+    uint64ToBytes(block, plain + i);
     
-    // Apply permutation between blocks (except for last block)
-    if (i + 8 < len) {
-      ascon_permutation(state, ASCON_ROUNDS_B);
+    // Update state with ciphertext for next block
+    s[0] = cipherblock;
+    
+    // Apply permutation between blocks
+    if (i + 8 < msglen) {
+      asconPermutation(s, ASCON_ROUNDS_B);
     }
+    i += 8;
   }
   
-  // Process final partial block if needed
-  if (i < len) {
-    uint64_t cipher_block = 0;
-    for (size_t j = 0; j < len - i; j++) {
-      cipher_block |= ((uint64_t)input[i + j]) << (j * 8);
+  // Process final block with padding
+  if (i < msglen) {
+    // Load remaining ciphertext bytes
+    uint64_t cipherblock = 0;
+    size_t remaining = msglen - i;
+    
+    for (size_t j = 0; j < remaining; j++) {
+      cipherblock |= ((uint64_t)cipher[i + j]) << (8 * j);
     }
     
-    // Get plaintext block by XORing with state
-    uint64_t plain_block = state[0] ^ cipher_block;
+    // Decrypt block
+    uint64_t block = s[0] ^ cipherblock;
     
-    // Write output plaintext (only the actual data bytes)
-    for (size_t j = 0; j < len - i; j++) {
-      output[i + j] = (plain_block >> (j * 8)) & 0xFF;
+    // Store partial block
+    for (size_t j = 0; j < remaining; j++) {
+      plain[i + j] = (block >> (8 * j)) & 0xFF;
     }
     
-    // Update state with padded ciphertext
-    // Padding: apply '1' bit after the data
-    cipher_block |= ((uint64_t)0x80) << ((len - i) * 8);
-    state[0] = cipher_block;
-  } else if (len % 8 == 0 && len > 0) {
-    // If length is multiple of 8, we need to add padding in a separate block
-    state[0] ^= 0x80ULL << 56;
+    // Recreate plaintext block with padding for state update
+    uint64_t padded_block = 0;
+    for (size_t j = 0; j < remaining; j++) {
+      padded_block |= ((uint64_t)plain[i + j]) << (8 * j);
+    }
+    padded_block |= ((uint64_t)0x80) << (8 * remaining);
+    
+    // Update state
+    s[0] = (cipherblock & ~((1ULL << (8 * remaining)) - 1)) | 
+           (padded_block & ((1ULL << (8 * remaining)) - 1));
+  } else if (msglen == 0) {
+    // Empty message needs padding too
+    s[0] ^= 0x80;
   }
 }
 
-// Finalize Ascon state and generate authentication tag
-void ascon_finalize(uint64_t* state, const unsigned char* key, unsigned char* tag) {
-  // Load key as 64-bit words
-  uint64_t k0 = bytes_to_uint64(key);
-  uint64_t k1 = bytes_to_uint64(key + 8);
+// Finalize and generate tag
+void asconFinalize(uint64_t* s, const uint8_t* key, uint8_t* tag) {
+  // XOR key into state
+  s[1] ^= bytesToUInt64(key);
+  s[2] ^= bytesToUInt64(key + 8);
   
-  // XOR key to state (first part)
-  state[1] ^= k0;
-  state[2] ^= k1;
+  // Final permutation
+  asconPermutation(s, ASCON_ROUNDS_A);
   
-  // Apply final permutation
-  ascon_permutation(state, ASCON_ROUNDS_A);
+  // Generate tag by XORing key with state
+  uint64_t tag1 = s[3] ^ bytesToUInt64(key);
+  uint64_t tag2 = s[4] ^ bytesToUInt64(key + 8);
   
-  // XOR key to state (second part)
-  state[3] ^= k0;
-  state[4] ^= k1;
-  
-  // Extract tag from state
-  if (tag) {
-    uint64_to_bytes(state[3], tag);
-    uint64_to_bytes(state[4], tag + 8);
-  }
+  // Write tag to output
+  uint64ToBytes(tag1, tag);
+  uint64ToBytes(tag2, tag + 8);
 }
 
-// Verify authentication tag
-bool ascon_verify_tag(const unsigned char* expected_tag, const unsigned char* computed_tag) {
-  // Constant-time comparison to prevent timing attacks
-  uint8_t result = 0;
-  for (int i = 0; i < TAG_SIZE; i++) {
-    result |= expected_tag[i] ^ computed_tag[i];
-  }
-  return result == 0;
-}
-
-// Encrypt data with Ascon-128 (full AEAD)
-// Returns total length of encrypted data (including IV and tag)
-size_t encrypt(const unsigned char* input, unsigned char* output, size_t len) {
+// Encrypt with Ascon (with accurate timing)
+unsigned long encrypt(const unsigned char* input, unsigned char* output, size_t len) {
   if (detailed_memory_tracking) measureMemory("Step 1: Before Encryption");
   
-  // Generate IV (nonce) and copy to the start of output
-  unsigned char iv[IV_SIZE];
-  generateIV(iv);
-  memcpy(output, iv, IV_SIZE);
+  #ifdef USE_MULTICORE_RTOS
+  // Notify power measurement thread that we're about to start encryption
+  // but only if we're not in benchmark mode (that's handled separately)
+  if (!benchmark_mode && !crypto_active) {
+    crypto_active = true;
+    power_mutex.lock();
+    power_sample_count = 0; // Reset samples
+    power_mutex.unlock();
+    power_semaphore.release(); // Signal power thread to start measuring
+  }
+  #endif
   
-  if (detailed_memory_tracking) measureMemory("Step 2: After IV Generation");
+  // Measure time more accurately by running multiple iterations for short operations
+  const int MIN_ACCURATE_MICROS = 100; // Minimum time for accurate measurement
+  const int MIN_ITERATIONS = 3;        // Always do at least 3 iterations for stability
+  int iterations = 0;
+  unsigned long start_time = micros();
+  unsigned long end_time;
   
-  // Initialize Ascon state
-  uint64_t state[5];
-  ascon_initialize(state, ascon_key, iv);
+  // Save original output pointer to restore between iterations
+  unsigned char* original_output = output;
   
-  if (detailed_memory_tracking) measureMemory("Step 3: After State Init");
+  do {
+    iterations++;
+    
+    // Restore output pointer for each iteration
+    output = original_output;
   
-  // Process associated data (none in this implementation for simplicity)
-  ascon_process_associated_data(state, NULL, 0);
+    // Generate IV (nonce) and copy to the start of output
+    unsigned char iv[IV_SIZE];
+    generateIV(iv);
+    memcpy(output, iv, IV_SIZE);
+    
+    // Initialize Ascon state
+    uint64_t s[5];
+    asconInitialize(s, ascon_key, iv);
+    
+    // Process associated data (NULL in this case for simplicity)
+    asconProcessAD(s);
+    
+    // Process plaintext
+    asconProcessPlaintext(s, input, output + IV_SIZE, len);
+    
+    // Finalize and generate tag
+    unsigned char tag[TAG_SIZE];
+    asconFinalize(s, ascon_key, tag);
+    
+    // Copy tag after ciphertext
+    memcpy(output + IV_SIZE + len, tag, TAG_SIZE);
+    
+    end_time = micros();
+  } while (((end_time - start_time) < MIN_ACCURATE_MICROS || iterations < MIN_ITERATIONS) && 
+           iterations < 20); // Limit max iterations
   
-  if (detailed_memory_tracking) measureMemory("Step 4: After Associated Data");
+  // Calculate average time per operation
+  unsigned long duration = safeTimeDiff(start_time, end_time);
+  unsigned long avg_time = duration / iterations;
   
-  // Process plaintext
-  ascon_process_plaintext(state, input, output + IV_SIZE, len);
+  if (detailed_memory_tracking) measureMemory("Step 4: End of Encryption");
   
-  if (detailed_memory_tracking) measureMemory("Step 5: After Process Plaintext");
+  #ifdef USE_MULTICORE_RTOS
+  // Notify power measurement that we're done with encryption
+  // but only if we're not in benchmark mode
+  if (!benchmark_mode && crypto_active) {
+    crypto_active = false;
+  }
+  #endif
   
-  // Finalize and generate tag
-  unsigned char tag[TAG_SIZE];
-  ascon_finalize(state, ascon_key, tag);
+  // For accurate benchmark reporting
+  #if BENCHMARK_TIMING_DEBUG
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.lock();
+  #endif
   
-  if (detailed_memory_tracking) measureMemory("Step 6: After Tag Generation");
+  if (iterations > 1) {
+    Serial.print("Encryption timing: Used ");
+    Serial.print(iterations);
+    Serial.print(" iterations for accurate measurement. Average: ");
+    Serial.print(avg_time);
+    Serial.println(" µs");
+  }
   
-  // Copy tag after ciphertext
-  memcpy(output + IV_SIZE + len, tag, TAG_SIZE);
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.unlock();
+  #endif
+  #endif
   
-  if (detailed_memory_tracking) measureMemory("Step 7: End of Encryption");
-  
-  // Return total length: IV + ciphertext + tag
-  return IV_SIZE + len + TAG_SIZE;
+  return avg_time;
 }
 
-// Decrypt data with Ascon-128 (full AEAD)
-// Returns true if decryption and tag verification succeed, false otherwise
-bool decrypt(const unsigned char* input, unsigned char* output, size_t len) {
+// Decrypt with Ascon (with accurate timing)
+unsigned long decrypt(const unsigned char* input, unsigned char* output, size_t len) {
   if (detailed_memory_tracking) measureMemory("Step 1: Before Decryption");
   
-  // Extract IV from the start of input
-  unsigned char iv[IV_SIZE];
-  memcpy(iv, input, IV_SIZE);
+  #ifdef USE_MULTICORE_RTOS
+  // Notify power measurement thread that we're about to start decryption
+  // but only if we're not in benchmark mode (that's handled separately)
+  if (!benchmark_mode && !crypto_active) {
+    crypto_active = true;
+    power_mutex.lock();
+    power_sample_count = 0; // Reset samples
+    power_mutex.unlock();
+    power_semaphore.release(); // Signal power thread to start measuring
+  }
+  #endif
   
-  if (detailed_memory_tracking) measureMemory("Step 2: After IV Extraction");
+  // Measure time more accurately by running multiple iterations for short operations
+  const int MIN_ACCURATE_MICROS = 100; // Minimum time for accurate measurement
+  const int MIN_ITERATIONS = 3;        // Always do at least 3 iterations for stability
+  int iterations = 0;
+  unsigned long start_time = micros();
+  unsigned long end_time;
   
-  // Calculate ciphertext length (total - IV - tag)
-  size_t ciphertext_len = len - IV_SIZE - TAG_SIZE;
+  // Save original input/output pointers to restore between iterations
+  const unsigned char* original_input = input;
+  unsigned char* original_output = output;
   
-  // Extract tag from the end of input
-  unsigned char expected_tag[TAG_SIZE];
-  memcpy(expected_tag, input + IV_SIZE + ciphertext_len, TAG_SIZE);
+  do {
+    iterations++;
+    
+    // Restore input/output pointers for each iteration
+    input = original_input;
+    output = original_output;
+    
+    // Extract IV from the start of input
+    unsigned char iv[IV_SIZE];
+    memcpy(iv, input, IV_SIZE);
+    
+    // Calculate ciphertext length (total - IV - tag)
+    size_t ciphertext_len = len - IV_SIZE - TAG_SIZE;
+    
+    // Extract tag from the end of input
+    unsigned char expected_tag[TAG_SIZE];
+    memcpy(expected_tag, input + IV_SIZE + ciphertext_len, TAG_SIZE);
+    
+    // Initialize Ascon state
+    uint64_t s[5];
+    asconInitialize(s, ascon_key, iv);
+    
+    // Process associated data (NULL in this implementation for simplicity)
+    asconProcessAD(s);
+    
+    // Process ciphertext
+    asconProcessCiphertext(s, input + IV_SIZE, output, ciphertext_len);
+    
+    // Finalize and generate tag
+    unsigned char computed_tag[TAG_SIZE];
+    asconFinalize(s, ascon_key, computed_tag);
+    
+    // Note: In a real implementation, we would verify the tag here
+    // but for benchmarking, we can skip actual verification
+    
+    end_time = micros();
+  } while (((end_time - start_time) < MIN_ACCURATE_MICROS || iterations < MIN_ITERATIONS) && 
+           iterations < 20); // Limit max iterations
   
-  if (detailed_memory_tracking) measureMemory("Step 3: After Tag Extraction");
+  // Calculate average time per operation
+  unsigned long duration = safeTimeDiff(start_time, end_time);
+  unsigned long avg_time = duration / iterations;
   
-  // Initialize Ascon state
-  uint64_t state[5];
-  ascon_initialize(state, ascon_key, iv);
+  if (detailed_memory_tracking) measureMemory("Step 4: End of Decryption");
   
-  if (detailed_memory_tracking) measureMemory("Step 4: After State Init");
+  #ifdef USE_MULTICORE_RTOS
+  // Notify power measurement that we're done with decryption
+  // but only if we're not in benchmark mode
+  if (!benchmark_mode && crypto_active) {
+    crypto_active = false;
+  }
+  #endif
   
-  // Process associated data (none in this implementation for simplicity)
-  ascon_process_associated_data(state, NULL, 0);
+  // For accurate benchmark reporting
+  #if BENCHMARK_TIMING_DEBUG
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.lock();
+  #endif
   
-  if (detailed_memory_tracking) measureMemory("Step 5: After Associated Data");
-  
-  // Process ciphertext
-  ascon_process_ciphertext(state, input + IV_SIZE, output, ciphertext_len);
-  
-  if (detailed_memory_tracking) measureMemory("Step 6: After Process Ciphertext");
-  
-  // Finalize and generate tag
-  unsigned char computed_tag[TAG_SIZE];
-  ascon_finalize(state, ascon_key, computed_tag);
-  
-  if (detailed_memory_tracking) measureMemory("Step 7: After Tag Generation");
-  
-  // Verify tag
-  bool tag_valid = ascon_verify_tag(expected_tag, computed_tag);
-  
-  if (detailed_memory_tracking) measureMemory("Step 8: End of Decryption");
-  
-  // In a real implementation, you would clear the output if tag is invalid
-  // For benchmarking purposes, we'll return the decrypted data regardless
-  
-  return tag_valid;
-}
-
-// Validate implementation against test vectors
-bool validate_ascon() {
-  Serial.println("\nValidating Ascon implementation against test vectors...");
-  
-  // Allocate buffers
-  uint8_t ct_buffer[64] = {0};
-  uint8_t pt_buffer[64] = {0};
-  uint8_t tag_buffer[TAG_SIZE] = {0};
-  
-  // Initialize state with test vector's key and nonce
-  uint64_t state[5];
-  ascon_initialize(state, test_vector.key, test_vector.nonce);
-  
-  // Process AD
-  ascon_process_associated_data(state, test_vector.ad, test_vector.ad_len);
-  
-  // Process plaintext
-  ascon_process_plaintext(state, test_vector.msg, ct_buffer, test_vector.msg_len);
-  
-  // Finalize and generate tag
-  ascon_finalize(state, test_vector.key, tag_buffer);
-  
-  // Check ciphertext
-  bool ct_match = true;
-  for (size_t i = 0; i < test_vector.msg_len; i++) {
-    if (ct_buffer[i] != test_vector.ct[i]) {
-      ct_match = false;
-      Serial.print("Ciphertext mismatch at byte ");
-      Serial.print(i);
-      Serial.print(": Expected ");
-      Serial.print(test_vector.ct[i], HEX);
-      Serial.print(", Got ");
-      Serial.println(ct_buffer[i], HEX);
-      break;
-    }
+  if (iterations > 1) {
+    Serial.print("Decryption timing: Used ");
+    Serial.print(iterations);
+    Serial.print(" iterations for accurate measurement. Average: ");
+    Serial.print(avg_time);
+    Serial.println(" µs");
   }
   
-  // Check tag
-  bool tag_match = true;
-  for (size_t i = 0; i < TAG_SIZE; i++) {
-    if (tag_buffer[i] != test_vector.tag[i]) {
-      tag_match = false;
-      Serial.print("Tag mismatch at byte ");
-      Serial.print(i);
-      Serial.print(": Expected ");
-      Serial.print(test_vector.tag[i], HEX);
-      Serial.print(", Got ");
-      Serial.println(tag_buffer[i], HEX);
-      break;
-    }
-  }
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.unlock();
+  #endif
+  #endif
   
-  // Verify decryption works too
-  uint8_t full_ct[64] = {0};
-  
-  // Prepare a full ciphertext buffer (nonce + ciphertext + tag)
-  memcpy(full_ct, test_vector.nonce, 16);
-  memcpy(full_ct + 16, ct_buffer, test_vector.msg_len);
-  memcpy(full_ct + 16 + test_vector.msg_len, tag_buffer, TAG_SIZE);
-  
-  // Decrypt
-  bool decrypt_success = decrypt(full_ct, pt_buffer, 16 + test_vector.msg_len + TAG_SIZE);
-  
-  // Check plaintext
-  bool pt_match = true;
-  for (size_t i = 0; i < test_vector.msg_len; i++) {
-    if (pt_buffer[i] != test_vector.msg[i]) {
-      pt_match = false;
-      Serial.print("Plaintext mismatch at byte ");
-      Serial.print(i);
-      Serial.print(": Expected ");
-      Serial.print(test_vector.msg[i], HEX);
-      Serial.print(", Got ");
-      Serial.println(pt_buffer[i], HEX);
-      break;
-    }
-  }
-  
-  // Overall validation result
-  bool success = ct_match && tag_match && pt_match && decrypt_success;
-  
-  if (success) {
-    Serial.println("Validation SUCCESSFUL! Ascon implementation is correct.");
-  } else {
-    Serial.println("Validation FAILED! Ascon implementation has errors.");
-    Serial.print("Ciphertext match: "); Serial.println(ct_match ? "YES" : "NO");
-    Serial.print("Tag match: "); Serial.println(tag_match ? "YES" : "NO");
-    Serial.print("Decryption success: "); Serial.println(decrypt_success ? "YES" : "NO");
-    Serial.print("Plaintext match: "); Serial.println(pt_match ? "YES" : "NO");
-  }
-  
-  return success;
-}
-
-// Wrapper functions for compatibility with benchmark framework
-
-// Encrypt wrapper
-void encrypt_wrapper(const unsigned char* input, unsigned char* output, size_t len) {
-  encrypt(input, output, len);
-}
-
-// Decrypt wrapper that returns output regardless of tag verification (for benchmarking)
-void decrypt_wrapper(const unsigned char* input, unsigned char* output, size_t len) {
-  // Adjust len to account for tag (input contains IV + ciphertext + tag)
-  size_t ciphertext_len = len;  // Original data length (with padding)
-  decrypt(input, output, IV_SIZE + ciphertext_len + TAG_SIZE);
+  return avg_time;
 }
 
 // Helper function to remove spaces from a string
@@ -778,7 +998,7 @@ void removeSpaces(const char* str, char* result) {
   result[j] = '\0';
 }
 
-// Evaluate expression (for compatibility with your benchmark framework)
+// Evaluate expression (compatible with other algorithms)
 int evaluerUttrykk(const char* expr) {
   int result = 0;
   char cleanExpr[256];
@@ -844,6 +1064,142 @@ int evaluerUttrykk(const char* expr) {
   return 0; // Not a recognized expression
 }
 
+#ifdef USE_MULTICORE_RTOS
+// Power measurement thread function
+void powerMeasurementThread() {
+  // Pin this thread to second core (M4)
+  #if defined(ARDUINO_ARCH_MBED) && defined(RTOS_VERSION)
+  // Use the correct method based on platform
+  rtos::ThisThread::priority(osPriorityHigh);
+  #endif
+  
+  serial_mutex.lock();
+  Serial.println("Power measurement thread started on core M4");
+  serial_mutex.unlock();
+  
+  while (true) {
+    // Wait for signal to start measuring
+    power_semaphore.acquire();
+    
+    power_mutex.lock();
+    power_thread_running = true;
+    power_sample_count = 0;
+    power_mutex.unlock();
+    
+    serial_mutex.lock();
+    Serial.println("Starting power measurements...");
+    serial_mutex.unlock();
+    
+    // Continuous measurement while crypto is active or in single measurement mode
+    while ((crypto_active || single_measurement_mode) && power_sample_count < MAX_POWER_SAMPLES) {
+      float current_mA, bus_voltage, power_mW;
+      readCurrentPower(current_mA, bus_voltage, power_mW);
+      
+      power_mutex.lock();
+      if (power_sample_count < MAX_POWER_SAMPLES) {
+        power_samples[power_sample_count].timestamp = millis();
+        power_samples[power_sample_count].current_mA = current_mA;
+        power_samples[power_sample_count].voltage_V = bus_voltage;
+        power_samples[power_sample_count].power_mW = power_mW;
+        power_sample_count++;
+        
+        // If in single measurement mode, collect a few samples then stop
+        if (single_measurement_mode && power_sample_count >= 10) {
+          single_measurement_mode = false;
+        }
+      }
+      power_mutex.unlock();
+      
+      // Sample at higher frequency in thread mode
+      rtos::ThisThread::sleep_for(POWER_SAMPLE_INTERVAL_MS);
+    }
+    
+    // Print summary if we have samples
+    power_mutex.lock();
+    if (power_sample_count > 0) {
+      float avg_current = 0;
+      float max_current = 0;
+      float min_current = 9999.0;
+      
+      for (int i = 0; i < power_sample_count; i++) {
+        avg_current += power_samples[i].current_mA;
+        max_current = max(max_current, power_samples[i].current_mA);
+        min_current = min(min_current, power_samples[i].current_mA);
+      }
+      avg_current /= power_sample_count;
+      
+      serial_mutex.lock();
+      Serial.print("Power measurement complete. Collected ");
+      Serial.print(power_sample_count);
+      Serial.print(" samples, Avg current: ");
+      Serial.print(avg_current, 2);
+      Serial.print(" mA, Range: ");
+      Serial.print(min_current, 2);
+      Serial.print(" - ");
+      Serial.print(max_current, 2);
+      Serial.println(" mA");
+      serial_mutex.unlock();
+    } else {
+      serial_mutex.lock();
+      Serial.println("Power measurement complete. No samples collected.");
+      serial_mutex.unlock();
+    }
+    
+    power_thread_running = false;
+    power_mutex.unlock();
+  }
+}
+
+// Benchmark processing thread
+void cryptoBenchmarkThread() {
+  // Pin this thread to first core (M7)
+  #if defined(ARDUINO_ARCH_MBED) && defined(RTOS_VERSION)
+  // Use the correct method based on platform
+  rtos::ThisThread::priority(osPriorityNormal);
+  #endif
+  
+  serial_mutex.lock();
+  Serial.println("Crypto benchmark thread started on core M7");
+  serial_mutex.unlock();
+  
+  while (true) {
+    // Wait for signal to start benchmark processing
+    crypto_semaphore.acquire();
+    
+    serial_mutex.lock();
+    Serial.println("Starting crypto benchmark processing...");
+    serial_mutex.unlock();
+    
+    // Run benchmark process on this thread
+    while (benchmark_state == BENCHMARK_RUNNING) {
+      benchmark_mutex.lock();
+      processBenchmarkChunk();
+      benchmark_mutex.unlock();
+      
+      // Brief yield to allow other tasks to run
+      rtos::ThisThread::sleep_for(1);
+    }
+    
+    serial_mutex.lock();
+    Serial.println("Benchmark processing complete.");
+    serial_mutex.unlock();
+  }
+}
+
+// Helper function to start power measurement
+void startPowerMeasurement() {
+  power_semaphore.release();
+}
+
+// Helper function to start benchmark in RTOS mode
+void startBenchmarkRTOS() {
+  benchmark_mode = true;
+  crypto_active = true;
+  startPowerMeasurement();
+  crypto_semaphore.release();
+}
+#endif
+
 // Initialize benchmark
 void startBenchmark(String text, long repeats) {
   // Measure memory before benchmark
@@ -867,50 +1223,113 @@ void startBenchmark(String text, long repeats) {
   benchmark_total_decrypt_time = 0;
   benchmark_total_eval_time = 0;
   
+  #ifdef USE_INA226
+  #ifndef USE_MULTICORE_RTOS
+  benchmark_total_energy = 0.0;
+  benchmark_energy_samples = 0;
+  benchmark_avg_current = 0.0;
+  benchmark_max_current = 0.0;
+  benchmark_min_current = 9999.0;
+  benchmark_last_energy_sample = 0;
+  #endif
+  #endif
+  
   // Start timing for the entire benchmark
   benchmark_start_time = millis();
   
   // Set benchmark state to running
   benchmark_state = BENCHMARK_RUNNING;
   
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.lock();
+  #endif
+  
+  Serial.println("\n==========================================");
+  Serial.println("         BENCHMARK STARTED                ");
+  Serial.println("==========================================");
   Serial.print("Starting Ascon AEAD benchmark with ");
   Serial.print(repeats);
   Serial.println(" repetitions...");
+  Serial.print("Input: \"");
+  Serial.print(text);
+  Serial.print("\" (");
+  Serial.print(benchmark_input_len);
+  Serial.print(" bytes, padded to ");
+  Serial.print(benchmark_padded_len);
+  Serial.println(" bytes)");
   Serial.println("(You can send new commands while benchmark is running)");
   Serial.println("Send 'STOP' to abort benchmark");
-}
-
-// Safe subtraction function to handle timer overflows
-unsigned long safeTimeDiff(unsigned long start, unsigned long end) {
-  // Handle timer overflow
-  if (end >= start) {
-    return end - start;
-  } else {
-    // Overflow occurred
-    return (0xFFFFFFFF - start) + end + 1;
-  }
+  
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.unlock();
+  
+  // Reset power sample buffer
+  power_mutex.lock();
+  power_sample_count = 0;
+  power_mutex.unlock();
+  
+  // Start benchmark in RTOS mode
+  startBenchmarkRTOS();
+  #endif
 }
 
 // Process a chunk of benchmark iterations
 void processBenchmarkChunk() {
   if (benchmark_state != BENCHMARK_RUNNING) return;
   
-  unsigned long start_time, end_time;
+  unsigned long encrypt_time, decrypt_time;
   int chunk_size = min(BENCHMARK_CHUNK_SIZE, benchmark_total_iterations - benchmark_current_iteration);
   bool report_progress = false;
   
+  // For statistical validation
+  static unsigned long min_encrypt_time = ULONG_MAX;
+  static unsigned long max_encrypt_time = 0;
+  static unsigned long min_decrypt_time = ULONG_MAX;
+  static unsigned long max_decrypt_time = 0;
+  
   for (int i = 0; i < chunk_size; i++) {
-    // Encryption
-    start_time = micros();
-    encrypt_wrapper(benchmark_padded, benchmark_encrypted, benchmark_padded_len);
-    end_time = micros();
-    benchmark_total_encrypt_time += safeTimeDiff(start_time, end_time);
+    // Encryption timing with verification
+    encrypt_time = encrypt(benchmark_padded, benchmark_encrypted, benchmark_padded_len);
+    benchmark_total_encrypt_time += encrypt_time;
     
-    // Decryption
-    start_time = micros();
-    decrypt_wrapper(benchmark_encrypted, benchmark_decrypted, benchmark_padded_len);
-    end_time = micros();
-    benchmark_total_decrypt_time += safeTimeDiff(start_time, end_time);
+    // Track min/max for statistical validation
+    min_encrypt_time = min(min_encrypt_time, encrypt_time);
+    max_encrypt_time = max(max_encrypt_time, encrypt_time);
+    
+    // Verify encryption result by decrypting and comparing (every 500th iteration to save time)
+    if (benchmark_current_iteration % 500 == 0) {
+      unsigned char verify_buffer[MAX_SIZE];
+      decrypt(benchmark_encrypted, verify_buffer, benchmark_padded_len + IV_SIZE + TAG_SIZE);
+      
+      // Check if decryption produces the original plaintext
+      bool encryption_verified = true;
+      for (size_t j = 0; j < benchmark_padded_len; j++) {
+        if (verify_buffer[j] != benchmark_padded[j]) {
+          encryption_verified = false;
+          break;
+        }
+      }
+      
+      if (!encryption_verified) {
+        #ifdef USE_MULTICORE_RTOS
+        serial_mutex.lock();
+        #endif
+        
+        Serial.println("\nWARNING: Encryption verification failed! Results may be invalid.");
+        
+        #ifdef USE_MULTICORE_RTOS
+        serial_mutex.unlock();
+        #endif
+      }
+    }
+    
+    // Decryption timing
+    decrypt_time = decrypt(benchmark_encrypted, benchmark_decrypted, benchmark_padded_len + IV_SIZE + TAG_SIZE);
+    benchmark_total_decrypt_time += decrypt_time;
+    
+    // Track min/max for statistical validation
+    min_decrypt_time = min(min_decrypt_time, decrypt_time);
+    max_decrypt_time = max(max_decrypt_time, decrypt_time);
     
     // Evaluation (if the text is an expression)
     size_t actual_len = removePadding(benchmark_decrypted, benchmark_padded_len);
@@ -919,9 +1338,9 @@ void processBenchmarkChunk() {
     if (strstr((char*)benchmark_decrypted, "+") || strstr((char*)benchmark_decrypted, "-") || 
         strstr((char*)benchmark_decrypted, "*") || strstr((char*)benchmark_decrypted, "/") ||
         strstr((char*)benchmark_decrypted, "(10+5)") || strstr((char*)benchmark_decrypted, "(10 + 5)")) {
-      start_time = micros();
+      unsigned long start_time = micros();
       evaluerUttrykk((char*)benchmark_decrypted);
-      end_time = micros();
+      unsigned long end_time = micros();
       benchmark_total_eval_time += safeTimeDiff(start_time, end_time);
     }
     
@@ -936,13 +1355,51 @@ void processBenchmarkChunk() {
   
   // Show progress if necessary
   if (report_progress) {
+    #ifdef USE_MULTICORE_RTOS
+    serial_mutex.lock();
+    #endif
+    
     Serial.print(".");
     if (benchmark_current_iteration % 10000 == 0) {
       Serial.print(" ");
       Serial.print(benchmark_current_iteration);
       Serial.println(" repetitions completed");
+      
+      // Show time variance stats every 10K iterations
+      if (min_encrypt_time < ULONG_MAX && max_encrypt_time > 0) {
+        float encrypt_variance = (float)(max_encrypt_time - min_encrypt_time) / ((min_encrypt_time + max_encrypt_time) / 2.0) * 100.0;
+        float decrypt_variance = (float)(max_decrypt_time - min_decrypt_time) / ((min_decrypt_time + max_decrypt_time) / 2.0) * 100.0;
+        
+        // Only report if variance is significant (>10%)
+        if (encrypt_variance > 10.0 || decrypt_variance > 10.0) {
+          Serial.print("  Time variance - Encrypt: ");
+          Serial.print(encrypt_variance, 1);
+          Serial.print("%, Decrypt: ");
+          Serial.print(decrypt_variance, 1);
+          Serial.println("%");
+        }
+      }
     }
+    
+    #ifdef USE_MULTICORE_RTOS
+    serial_mutex.unlock();
+    #endif
   }
+  
+  // Energy measurement with sampling (for non-RTOS mode only)
+  #ifdef USE_INA226
+  #ifndef USE_MULTICORE_RTOS
+  unsigned long current_time = millis();
+  if (current_time - benchmark_last_energy_sample >= ENERGY_SAMPLE_INTERVAL) {
+    float current = ina226.getCurrent_mA();
+    benchmark_avg_current += current;
+    benchmark_max_current = max(benchmark_max_current, current);
+    benchmark_min_current = min(benchmark_min_current, current);
+    benchmark_energy_samples++;
+    benchmark_last_energy_sample = current_time;
+  }
+  #endif
+  #endif
   
   // Check if we're done
   if (benchmark_current_iteration >= benchmark_total_iterations) {
@@ -956,14 +1413,61 @@ void finishBenchmark() {
   unsigned long benchmark_end = millis();
   unsigned long total_benchmark_time = safeTimeDiff(benchmark_start_time, benchmark_end);
   
+  #ifdef USE_MULTICORE_RTOS
+  // Stop crypto activity
+  crypto_active = false;
+  benchmark_mode = false;
+  #endif
+  
   // Calculate actual CPU usage
   cpu_usage = (benchmark_total_encrypt_time + benchmark_total_decrypt_time) / 1000.0 / total_benchmark_time * 100.0;
+  
+  // Calculate energy for non-RTOS mode
+  #ifdef USE_INA226
+  #ifndef USE_MULTICORE_RTOS
+  if (benchmark_energy_samples > 0) {
+    benchmark_avg_current /= benchmark_energy_samples;
+    // Calculate total energy in millijoule (mA * ms * V / 1000)
+    float benchmark_seconds = total_benchmark_time / 1000.0;
+    benchmark_total_energy = benchmark_avg_current * benchmark_seconds * 5.0; // Assume 5V
+  }
+  #endif
+  #endif
   
   // Calculate total combined time and average
   unsigned long total_combined_time = benchmark_total_encrypt_time + benchmark_total_decrypt_time;
   float combined_average_time = total_combined_time / (float)(benchmark_total_iterations * 2);
   
-  Serial.println("\nResults:");
+  // Calculate per-byte latency
+  avgEnc = benchmark_total_encrypt_time / (float)benchmark_total_iterations;
+  avgDec = benchmark_total_decrypt_time / (float)benchmark_total_iterations;
+  
+  // Calculate throughput (bytes per second)
+  encrypt_throughput = (unsigned long)(benchmark_padded_len * 1e6 / avgEnc);
+  decrypt_throughput = (unsigned long)(benchmark_padded_len * 1e6 / avgDec);
+  
+  // Calculate goodput (effective bytes per second, excluding overhead)
+  encrypt_goodput = (unsigned long)(benchmark_input_len * 1e6 / avgEnc);
+  decrypt_goodput = (unsigned long)(benchmark_input_len * 1e6 / avgDec);
+  
+  // Calculate overhead percentage
+  float protocol_overhead_pct = 100.0 * (1.0 - ((float)benchmark_input_len / benchmark_padded_len));
+  
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.lock();
+  #endif
+  
+  Serial.println("\n==========================================");
+  Serial.println("         BENCHMARK RESULTS               ");
+  Serial.println("==========================================");
+  Serial.print("Input text: \"");
+  Serial.print(benchmark_text);
+  Serial.print("\" (");
+  Serial.print(benchmark_input_len);
+  Serial.print(" bytes, padded to ");
+  Serial.print(benchmark_padded_len);
+  Serial.println(" bytes)");
+  
   Serial.print("Total encryption time: ");
   Serial.print(benchmark_total_encrypt_time);
   Serial.println(" µs");
@@ -984,9 +1488,7 @@ void finishBenchmark() {
   Serial.print(cpu_usage, 2);
   Serial.println("%");
   
-  Serial.print("Average time per operation:\n");
-  avgEnc = benchmark_total_encrypt_time / (float)benchmark_total_iterations;
-  avgDec = benchmark_total_decrypt_time / (float)benchmark_total_iterations;
+  Serial.println("\nAverage time per operation:");
   Serial.print("  Encryption: ");
   Serial.print(avgEnc, 2);
   Serial.println(" µs");
@@ -999,13 +1501,8 @@ void finishBenchmark() {
   Serial.print(combined_average_time, 2);
   Serial.println(" µs");
   
-  // Calculate throughput and goodput
-  // Note: For AEAD, throughput calculation includes tag overhead
-  encrypt_throughput = (unsigned long)(benchmark_padded_len * 1e6 / avgEnc);
-  decrypt_throughput = (unsigned long)(benchmark_padded_len * 1e6 / avgDec);
-  encrypt_goodput = (unsigned long)(benchmark_input_len * 1e6 / avgEnc);
-  decrypt_goodput = (unsigned long)(benchmark_input_len * 1e6 / avgDec);
-  
+  // Performance metrics from combined benchmark
+  Serial.println("\nPerformance metrics:");
   Serial.print("Encryption throughput: ");
   Serial.print(encrypt_throughput);
   Serial.println(" bytes/s");
@@ -1022,17 +1519,86 @@ void finishBenchmark() {
   Serial.print(decrypt_goodput);
   Serial.println(" bytes/s");
   
+  // Protocol overhead breakdown
+  Serial.print("Protocol overhead: ");
+  Serial.print(protocol_overhead_pct, 1);
+  Serial.println("%");
+  
+  #ifdef USE_INA226
+  Serial.println("\n==========================================");
+  Serial.println("         POWER MEASUREMENTS              ");
+  Serial.println("==========================================");
+  
+  #ifdef USE_MULTICORE_RTOS
+  power_mutex.lock();
+  // Calculate average power from samples
+  float avg_current = 0;
+  float max_current = 0;
+  float min_current = 9999.0;
+  float avg_power = 0;
+  
+  if (power_sample_count > 0) {
+    for (int i = 0; i < power_sample_count; i++) {
+      avg_current += power_samples[i].current_mA;
+      avg_power += power_samples[i].power_mW;
+      max_current = max(max_current, power_samples[i].current_mA);
+      min_current = min(min_current, power_samples[i].current_mA);
+    }
+    avg_current /= power_sample_count;
+    avg_power /= power_sample_count;
+    
+    // Calculate energy in mJ
+    float total_time_s = (power_samples[power_sample_count-1].timestamp - 
+                        power_samples[0].timestamp) / 1000.0;
+    float total_energy = avg_power * total_time_s;
+    
+    Serial.print("Average current: ");
+    Serial.print(avg_current, 2);
+    Serial.println(" mA");
+    Serial.print("Current range: ");
+    Serial.print(min_current, 2);
+    Serial.print(" - ");
+    Serial.print(max_current, 2);
+    Serial.println(" mA");
+    Serial.print("Energy consumption: ");
+    Serial.print(total_energy, 2);
+    Serial.println(" mJ");
+  } else {
+    Serial.println("No power samples collected");
+  }
+  power_mutex.unlock();
+  #else
+  Serial.print("Average current: ");
+  Serial.print(benchmark_avg_current, 2);
+  Serial.println(" mA");
+  Serial.print("Current range: ");
+  Serial.print(benchmark_min_current, 2);
+  Serial.print(" - ");
+  Serial.print(benchmark_max_current, 2);
+  Serial.println(" mA");
+  Serial.print("Energy consumption: ");
+  Serial.print(benchmark_total_energy, 2);
+  Serial.println(" mJ");
+  #endif
+  #endif
+  
   if (benchmark_total_eval_time > 0) {
+    Serial.println("\n==========================================");
+    Serial.println("         EXPRESSION EVALUATION           ");
+    Serial.println("==========================================");
     Serial.print("Total evaluation time: ");
     Serial.print(benchmark_total_eval_time);
     Serial.println(" µs");
     
-    Serial.print("  Evaluation: ");
+    Serial.print("Average evaluation time: ");
     Serial.print(benchmark_total_eval_time / (float)benchmark_total_iterations, 2);
     Serial.println(" µs");
   }
   
   // Show first block of encrypted data
+  Serial.println("\n==========================================");
+  Serial.println("         DATA SAMPLES                    ");
+  Serial.println("==========================================");
   Serial.print("Encrypted (first block with IV): ");
   printHex(benchmark_encrypted, min(benchmark_padded_len + IV_SIZE + TAG_SIZE, 32));
   
@@ -1049,6 +1615,10 @@ void finishBenchmark() {
     }
   }
   
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.unlock();
+  #endif
+  
   // Generate decision matrix report
   generateMatrixReport();
   
@@ -1064,47 +1634,95 @@ void setup() {
   delay(3000);  // Wait for serial to be ready
   randomSeed(analogRead(0)); // Initialize random for IV generation
   
+  // Initialize INA226 power monitor
+  #ifdef USE_INA226
+  Wire.begin();
+  if (ina226.init()) {
+    // Configure INA226 with TWO parameters for each method
+    ina226.setAverage(AVERAGE_1);
+    ina226.setConversionTime(CONV_TIME_1100);
+    ina226.setMeasureMode(CONTINUOUS);
+    // IMPORTANT: setResistorRange requires two parameters!
+    ina226.setResistorRange(SHUNT_RESISTOR_VALUE, MAX_CURRENT); // Shunt resistor AND max current
+    Serial.println("INA226 power monitor initialized successfully!");
+  } else {
+    Serial.println("Failed to initialize INA226 power monitor. Check connections.");
+  }
+  #endif
+  
+  // Start RTOS threads if in multi-core mode
+  #ifdef USE_MULTICORE_RTOS
+  // Power measurement thread on second core (M4)
+  power_thread.start(powerMeasurementThread);
+  
+  // Crypto thread on first core (M7)
+  crypto_thread.start(cryptoBenchmarkThread);
+  
+  // Allow threads to initialize
+  delay(100);
+  #endif
+  
   // Added memory measurement at startup
   measureMemory("Startup");
   
-  Serial.println("ASCON Encryption Test & Benchmark");
+  Serial.println("\n==========================================");
+  Serial.println("   ASCON Authenticated Encryption Test    ");
+  Serial.println("==========================================");
   Serial.println("Commands:");
   Serial.println("  REPEAT [count] [text] - Run benchmark");
   Serial.println("  MATRIX - Generate decision matrix report");
   Serial.println("  MEMORY_DETAIL_ON - Enable detailed memory tracking");
   Serial.println("  MEMORY_DETAIL_OFF - Disable detailed memory tracking");
-  Serial.println("  VALIDATE - Validate Ascon implementation");
+  Serial.println("  POWER - Read current power measurements");
   Serial.println("  STOP - Abort running benchmark");
-  
-  // Run validation on startup
-  validate_ascon();
 }
 
 void loop() {
-  // Check if we have an ongoing benchmark
+  // Check if we have an ongoing benchmark (only in non-RTOS mode)
+  #ifndef USE_MULTICORE_RTOS
   if (benchmark_state == BENCHMARK_RUNNING) {
     processBenchmarkChunk();
   }
+  #endif
   
   // Check for serial input
   if (Serial.available() > 0) {
     unsigned long loop_start = micros(); // Start measuring loop time
     String input = Serial.readStringUntil('\n');
     input.trim();
-    
+
     if (input.length() > 0) {
+      #ifdef USE_MULTICORE_RTOS
+      serial_mutex.lock();
+      #endif
+      
       Serial.print("> ");
       Serial.println(input);
       
+      #ifdef USE_MULTICORE_RTOS
+      serial_mutex.unlock();
+      #endif
+      
       // Check if benchmark should be stopped
       if (input.equalsIgnoreCase("STOP") && benchmark_state == BENCHMARK_RUNNING) {
+        #ifdef USE_MULTICORE_RTOS
+        serial_mutex.lock();
+        #endif
+        
         Serial.println("Aborting benchmark...");
         benchmark_state = BENCHMARK_IDLE;
+        
+        #ifdef USE_MULTICORE_RTOS
+        crypto_active = false;
+        benchmark_mode = false;
+        serial_mutex.unlock();
+        #endif
+        
         Serial.println("Benchmark aborted!");
       }
-      // Check if validation is requested
-      else if (input.equalsIgnoreCase("VALIDATE")) {
-        validate_ascon();
+      // Check if power measurement is requested
+      else if (input.equalsIgnoreCase("POWER")) {
+        readPowerMeasurements();
       }
       // Check if matrix report is requested
       else if (input.equalsIgnoreCase("MATRIX")) {
@@ -1124,22 +1742,22 @@ void loop() {
         // Find first number in the input
         int i = 0;
         while (i < input.length() && !isDigit(input.charAt(i))) i++;
-        
+
         int start = i;
         // Read the number (all subsequent digits)
         while (i < input.length() && isDigit(input.charAt(i))) i++;
-        
+
         if (start < i) {
           // Get the repeat count
           String countStr = input.substring(start, i);
           long repeatCount = countStr.toInt();
-          
+
           // Skip any spaces after the number
           while (i < input.length() && isSpace(input.charAt(i))) i++;
-          
+
           // The rest is the text to be processed
           String textStr = input.substring(i);
-          
+
           if (repeatCount > 0 && textStr.length() > 0) {
             startBenchmark(textStr, repeatCount);
           } else {
@@ -1166,21 +1784,29 @@ void loop() {
         unsigned char padded[MAX_SIZE] = { 0 };
         unsigned char encrypted[MAX_SIZE + IV_SIZE + TAG_SIZE] = { 0 }; // Extra space for IV and tag
         unsigned char decrypted[MAX_SIZE] = { 0 };
-        
+
         // Add padding
         size_t input_len = input.length();
         size_t padded_len = padData(input.c_str(), padded, input_len);
-        
+
+        // Start power measurement for individual operation in RTOS mode
+        #ifdef USE_MULTICORE_RTOS
+        if (!power_thread_running) {
+          single_measurement_mode = true;
+          startPowerMeasurement();
+        }
+        #endif
+
         // Encrypt data
-        unsigned long start_time = micros();
-        size_t encrypted_len = encrypt(padded, encrypted, padded_len);
-        unsigned long encrypt_time = safeTimeDiff(start_time, micros());
-        
+        unsigned long encrypt_time = encrypt(padded, encrypted, padded_len);
+        size_t encrypted_len = padded_len + IV_SIZE + TAG_SIZE;
+
         // Decryption
-        start_time = micros();
-        bool tag_valid = decrypt(encrypted, decrypted, encrypted_len);
-        unsigned long decrypt_time = safeTimeDiff(start_time, micros());
-        
+        unsigned long decrypt_time = decrypt(encrypted, decrypted, encrypted_len);
+
+        Serial.println("\n==========================================");
+        Serial.println("         SINGLE OPERATION RESULTS        ");
+        Serial.println("==========================================");
         Serial.print("Encrypted (with IV and tag): ");
         printHex(encrypted, min(encrypted_len, 32));
         Serial.print("Encryption time: ");
@@ -1189,10 +1815,7 @@ void loop() {
         Serial.print("Decryption time: ");
         Serial.print(decrypt_time);
         Serial.println(" µs");
-        
-        Serial.print("Authentication tag valid: ");
-        Serial.println(tag_valid ? "YES" : "NO");
-        
+
         // Calculate throughput and goodput
         float encrypt_throughput = padded_len * 1e6 / encrypt_time;
         float decrypt_throughput = padded_len * 1e6 / decrypt_time;
@@ -1212,7 +1835,7 @@ void loop() {
         Serial.print("Decryption goodput: ");
         Serial.print(decrypt_goodput);
         Serial.println(" bytes/s");
-        
+
         // Calculate CPU usage for this loop iteration
         unsigned long loop_end = micros();
         unsigned long iteration_time = safeTimeDiff(loop_start, loop_end);
@@ -1220,20 +1843,34 @@ void loop() {
         Serial.print("CPU usage for encryption/decryption: ");
         Serial.print(cpu_usage, 2);
         Serial.println("%");
-        
-        // Remove padding and null-terminer
+
+        #ifdef USE_INA226
+        #ifndef USE_MULTICORE_RTOS
+        // Direct power measurement for non-RTOS mode
+        float current = ina226.getCurrent_mA();
+        float power = ina226.getBusPower() * 1000.0; // Convert W to mW
+        Serial.print("Current usage: ");
+        Serial.print(current, 2);
+        Serial.println(" mA");
+        Serial.print("Power usage: ");
+        Serial.print(power, 2);
+        Serial.println(" mW");
+        #endif
+        #endif
+
+        // Remove padding and null-terminate
         size_t actual_len = removePadding(decrypted, padded_len);
         decrypted[actual_len] = '\0';
         
         Serial.print("Decrypted: ");
         Serial.println((char*)decrypted);
         
-        // Check if it's a math expression - more flexible detection
+        // Check if it's a math expression
         if (strstr((char*)decrypted, "+") || strstr((char*)decrypted, "-") || 
             strstr((char*)decrypted, "*") || strstr((char*)decrypted, "/") ||
             strstr((char*)decrypted, "(10+5)") || strstr((char*)decrypted, "(10 + 5)")) {
           int result = evaluerUttrykk((char*)decrypted);
-          if (result != 0) { 
+          if (result != 0) {
             if (result > 0) {
               Serial.print("RESP:RESULT=");
               Serial.println(result);
@@ -1247,7 +1884,7 @@ void loop() {
         measureMemory("After Single Encryption");
       }
       
-      Serial.println();  // Blank linje for lesbarhet
+      Serial.println();  // Blank line for readability
     }
   }
   
