@@ -1,6 +1,8 @@
 // Speck-64/128 CBC benchmark using Simon_Speck_Ciphers repo implementation
 // Compile (ARM64):
 //   aarch64-linux-gnu-g++ speck_benchmark.cpp speck.c -I. -o speck_bench_cbc_arm64
+// Post-compilation, measure ROM/Flash usage:
+//   aarch64-linux-gnu-size speck_bench_cbc_arm64
 
 #include <chrono>
 #include <iostream>
@@ -17,6 +19,14 @@
 
 #include "cipher_constants.h"
 #include "speck.h"
+
+// Compile-time estimation of ROM/Flash usage for the algorithm
+// These are rough estimates based on typical code sizes for Speck-64/128 and benchmark code
+// Actual values should be measured using `aarch64-linux-gnu-size` on the compiled binary
+static const size_t ESTIMATED_CODE_SIZE = 5000;       // Estimated size of speck.c code (bytes)
+static const size_t ESTIMATED_CONST_SIZE = 100;       // Estimated size of constants (speck_rounds, block_sizes, key_sizes)
+static const size_t ESTIMATED_BENCH_CODE_SIZE = 2000; // Estimated size of benchmark code
+static const size_t ESTIMATED_ROM_USAGE = ESTIMATED_CODE_SIZE + ESTIMATED_CONST_SIZE + ESTIMATED_BENCH_CODE_SIZE;
 
 int main(int argc, char *argv[])
 {
@@ -46,7 +56,7 @@ int main(int argc, char *argv[])
         key[i] = static_cast<uint8_t>(i);
     uint8_t iv[BLOCK_SIZE] = {0};
 
-    // Estimate algorithm's memory footprint
+    // Estimate algorithm's RAM footprint
     size_t cipher_struct_size = sizeof(SimSpk_Cipher); // Size of cipher object
     size_t key_size = KEY_SIZE;                        // Key buffer
     size_t iv_size = BLOCK_SIZE;                       // IV buffer
@@ -131,7 +141,9 @@ int main(int argc, char *argv[])
               << "CPUUsageEnc=" << cpu_usage_enc << "%\n"
               << "PeakRAMEnc=" << ram_enc_peak << " bytes\n"
               << "PeakRAMDec=" << ram_dec_peak << " bytes\n"
-              << "EstimatedAlgoRAM=" << total_algo_memory << " bytes\n";
+              << "EstimatedAlgoRAM=" << total_algo_memory << " bytes\n"
+              << "EstimatedROMUsage=" << ESTIMATED_ROM_USAGE << " bytes\n"
+              << "Note: For actual ROM/Flash usage, run: aarch64-linux-gnu-size " << argv[0] << "\n";
 
     return 0;
 }
