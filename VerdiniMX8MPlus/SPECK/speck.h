@@ -23,7 +23,7 @@ typedef struct _bytes6_t
     uint8_t data[6];
 } bytes6_t;
 
-uint8_t Speck_Init(SimSpk_Cipher *cipher_object, enum cipher_config_t cipher_cfg, enum mode_t c_mode, void *key, uint8_t *iv, uint8_t *counter);
+int Speck_Init(SimSpk_Cipher *cipher_object, enum cipher_config_t cipher_cfg, enum cipher_mode_t c_mode, void *key, uint8_t *iv, uint8_t *counter);
 
 uint8_t Speck_Encrypt(SimSpk_Cipher cipher_object, const void *plaintext, void *ciphertext);
 

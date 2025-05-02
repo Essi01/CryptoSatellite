@@ -2,7 +2,7 @@
 #ifndef CIPHER_CONSTANTS_H
 #define CIPHER_CONSTANTS_H
 
-enum mode_t
+enum cipher_mode_t
 {
     ECB,
     CTR,
@@ -12,7 +12,6 @@ enum mode_t
 };
 
 static const uint8_t block_sizes[] = {32, 48, 48, 64, 64, 96, 96, 128, 128, 128};
-
 static const uint16_t key_sizes[] = {64, 72, 96, 96, 128, 96, 144, 128, 192, 256};
 
 enum cipher_config_t

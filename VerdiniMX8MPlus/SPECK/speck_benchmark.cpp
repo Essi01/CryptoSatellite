@@ -1,9 +1,7 @@
 // speck_benchmark.cpp
-// Speck-64/128 CBC benchmark: run N iterations encrypting a given plaintext string
-// Compile with:
-//   g++ -O3 speck_benchmark.cpp -o speck_bench_cbc
-// Usage:
-//   ./speck_bench_cbc <iterations> "<plaintext>"
+// Speck-64/128 CBC benchmark using Simon_Speck_Ciphers repo implementation
+// Compile (ARM64):
+//   aarch64-linux-gnu-g++ speck_benchmark.cpp speck.c -I. -o speck_bench_cbc_arm64
 
 #include <chrono>
 #include <iostream>
@@ -11,122 +9,113 @@
 #include <cstdint>
 #include <string>
 #include <cstring>
+#include <sys/resource.h>
 
-#ifdef _MSC_VER
-#include <intrin.h>
-#define ROR64(x, r) _rotr64(x, r)
-#define ROL64(x, r) _rotl64(x, r)
-#else
-#define ROR64(x, r) ((uint64_t)(x) >> (r) | (uint64_t)(x) << (64 - (r)))
-#define ROL64(x, r) ((uint64_t)(x) << (r) | (uint64_t)(x) >> (64 - (r)))
+// Work around mode_t conflict from sys/types.h
+#ifdef mode_t
+#undef mode_t
 #endif
-#define ROUND(x, y, k)   \
-    do                   \
-    {                    \
-        x = ROR64(x, 8); \
-        x = x + y;       \
-        x ^= k;          \
-        y = ROL64(y, 3); \
-        y ^= x;          \
-    } while (0)
 
-static inline void speck64_128_encrypt_block(const uint64_t pt[2], uint64_t ct[2], const uint64_t key[2])
-{
-    uint64_t x = pt[1], y = pt[0];
-    uint64_t k0 = key[0], k1 = key[1];
-    ROUND(x, y, k0);
-    for (int i = 0; i < 31; ++i)
-    {
-        // key schedule on-the-fly
-        k1 = ROR64(k1, 8);
-        k1 = k1 + k0;
-        k1 ^= (uint64_t)i;
-        k0 = ROL64(k0, 3);
-        k0 ^= k1;
-        ROUND(x, y, k0);
-    }
-    ct[0] = y;
-    ct[1] = x;
-}
+#include "cipher_constants.h"
+#include "speck.h"
 
 int main(int argc, char *argv[])
 {
     if (argc < 3)
     {
-        std::cerr << "Usage: " << argv[0] << " <iterations> \"<plaintext>\"\n";
+        std::cerr << "Usage: " << argv[0] << " <iterations> <plaintext>\n";
         return 1;
     }
-
     size_t iterations = std::stoul(argv[1]);
-    std::string plaintext = argv[2];
+    std::string plain = argv[2];
 
-    const size_t WORD_BYTES = 8;
-    const size_t BYTES_PER_BLOCK = WORD_BYTES * 2; // 16 bytes per block
+    const size_t BLOCK_SIZE = 8; // bytes per block
+    const size_t KEY_SIZE = 16;  // bytes (128-bit key)
 
-    // Prepare plaintext buffer and pad
-    size_t data_len = plaintext.size();
-    size_t pad_len = ((data_len + BYTES_PER_BLOCK - 1) / BYTES_PER_BLOCK) * BYTES_PER_BLOCK;
-    std::vector<uint8_t> pt_bytes(pad_len, 0);
-    memcpy(pt_bytes.data(), plaintext.data(), data_len);
-    size_t blocks = pad_len / BYTES_PER_BLOCK;
+    // Pad plaintext
+    size_t data_len = plain.size();
+    size_t pad_len = ((data_len + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    std::vector<uint8_t> pt(pad_len, 0);
+    memcpy(pt.data(), plain.data(), data_len);
+    size_t blocks = pad_len / BLOCK_SIZE;
 
-    // Convert to 64-bit words
-    std::vector<uint64_t> pt_words(blocks * 2), ct_words(blocks * 2);
-    for (size_t i = 0; i < blocks; ++i)
-    {
-        uint64_t w0 = 0, w1 = 0;
-        for (size_t b = 0; b < WORD_BYTES; ++b)
-        {
-            w0 |= uint64_t(pt_bytes[i * BYTES_PER_BLOCK + b]) << (8 * b);
-            w1 |= uint64_t(pt_bytes[i * BYTES_PER_BLOCK + WORD_BYTES + b]) << (8 * b);
-        }
-        pt_words[2 * i] = w0;
-        pt_words[2 * i + 1] = w1;
-    }
+    std::vector<uint8_t> ct(pad_len), dt(pad_len);
 
-    // Key and IV
-    uint64_t key[2] = {0x8899AABBCCDDEEFFULL, 0x0011223344556677ULL};
-    uint64_t iv = 0;
+    // Example key and IV
+    uint8_t key[KEY_SIZE];
+    for (size_t i = 0; i < KEY_SIZE; ++i)
+        key[i] = static_cast<uint8_t>(i);
+    uint8_t iv[BLOCK_SIZE] = {0};
 
-    // Warm-up
+    // Measure CPU time for encryption
+    struct rusage ru_start, ru_end;
+    getrusage(RUSAGE_SELF, &ru_start);
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    // Encryption benchmark
     for (size_t it = 0; it < iterations; ++it)
     {
-        uint64_t prev = iv;
-        for (size_t i = 0; i < blocks; ++i)
+        SimSpk_Cipher cipher = {};
+        std::cout << "Before Speck_Init (encrypt): cipher.block_size = " << (int)cipher.block_size << "\n";
+        int init_result = Speck_Init(&cipher, cfg_128_64, CBC, key, iv, nullptr);
+        std::cout << "Speck_Init (encrypt) returned: " << init_result << "\n";
+        std::cout << "After Speck_Init (encrypt): cipher.block_size = " << (int)cipher.block_size << "\n";
+        if (init_result != 0)
         {
-            uint64_t in_blk[2] = {pt_words[2 * i] ^ prev, pt_words[2 * i + 1]};
-            uint64_t out_blk[2];
-            speck64_128_encrypt_block(in_blk, out_blk, key);
-            prev = out_blk[0];
+            std::cerr << "Speck_Init failed with return value: " << init_result << "\n";
+            return 1;
+        }
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            Speck_Encrypt(cipher, pt.data() + b * BLOCK_SIZE, ct.data() + b * BLOCK_SIZE);
         }
     }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    getrusage(RUSAGE_SELF, &ru_end);
 
-    // Benchmark
-    auto start = std::chrono::high_resolution_clock::now();
+    // Decryption benchmark
+    auto t2 = std::chrono::high_resolution_clock::now();
     for (size_t it = 0; it < iterations; ++it)
     {
-        uint64_t prev = iv;
-        for (size_t i = 0; i < blocks; ++i)
+        SimSpk_Cipher cipher = {};
+        std::cout << "Before Speck_Init (decrypt): cipher.block_size = " << (int)cipher.block_size << "\n";
+        int init_result = Speck_Init(&cipher, cfg_128_64, CBC, key, iv, nullptr);
+        std::cout << "Speck_Init (decrypt) returned: " << init_result << "\n";
+        std::cout << "After Speck_Init (decrypt): cipher.block_size = " << (int)cipher.block_size << "\n";
+        if (init_result != 0)
         {
-            uint64_t in_blk[2] = {pt_words[2 * i] ^ prev, pt_words[2 * i + 1]};
-            uint64_t out_blk[2];
-            speck64_128_encrypt_block(in_blk, out_blk, key);
-            ct_words[2 * i] = out_blk[0];
-            ct_words[2 * i + 1] = out_blk[1];
-            prev = out_blk[0];
+            std::cerr << "Speck_Init failed with return value: " << init_result << "\n";
+            return 1;
+        }
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            Speck_Decrypt(cipher, ct.data() + b * BLOCK_SIZE, dt.data() + b * BLOCK_SIZE);
         }
     }
-    auto end = std::chrono::high_resolution_clock::now();
+    auto t3 = std::chrono::high_resolution_clock::now();
 
-    std::chrono::duration<double> elapsed = end - start;
-    double seconds = elapsed.count();
+    // Calculate metrics
+    double enc_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    double dec_us = std::chrono::duration<double, std::micro>(t3 - t2).count();
+    double avg_enc = enc_us / iterations;
+    double avg_dec = dec_us / iterations;
+    double tp_enc = (iterations * pad_len) / (enc_us / 1e6);
+    double tp_dec = (iterations * pad_len) / (dec_us / 1e6);
 
-    double latency_us = (seconds * 1e6) / iterations;
-    double throughput_kBps = (iterations * pad_len) / 1024.0 / seconds;
+    // CPU usage for encryption
+    double wall_enc_s = std::chrono::duration<double>(t1 - t0).count();
+    double cpu_start = ru_start.ru_utime.tv_sec + ru_start.ru_utime.tv_usec / 1e6 + ru_start.ru_stime.tv_sec + ru_start.ru_stime.tv_usec / 1e6;
+    double cpu_end = ru_end.ru_utime.tv_sec + ru_end.ru_utime.tv_usec / 1e6 + ru_end.ru_stime.tv_sec + ru_end.ru_stime.tv_usec / 1e6;
+    double cpu_usage_enc = ((cpu_end - cpu_start) / wall_enc_s) * 100.0;
 
-    std::cout << "Iterations: " << iterations << "\n";
-    std::cout << "Message size: " << data_len << " bytes (" << blocks << " blocks)\n";
-    std::cout << "Latency: " << latency_us << " us/enc\n";
-    std::cout << "Throughput: " << throughput_kBps << " kB/s\n";
+    // Output metrics
+    std::cout << "Enc=" << enc_us << " us\n"
+              << "Dec=" << dec_us << " us\n"
+              << "AvgEnc=" << avg_enc << " us\n"
+              << "AvgDec=" << avg_dec << " us\n"
+              << "ThroughputEnc=" << tp_enc << " B/s\n"
+              << "ThroughputDec=" << tp_dec << " B/s\n"
+              << "CPUUsageEnc=" << cpu_usage_enc << "%\n";
+
     return 0;
 }
