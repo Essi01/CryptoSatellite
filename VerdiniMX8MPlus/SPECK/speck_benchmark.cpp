@@ -1,4 +1,3 @@
-// speck_benchmark.cpp
 // Speck-64/128 CBC benchmark using Simon_Speck_Ciphers repo implementation
 // Compile (ARM64):
 //   aarch64-linux-gnu-g++ speck_benchmark.cpp speck.c -I. -o speck_bench_cbc_arm64
@@ -47,8 +46,17 @@ int main(int argc, char *argv[])
         key[i] = static_cast<uint8_t>(i);
     uint8_t iv[BLOCK_SIZE] = {0};
 
-    // Measure CPU time for encryption
-    struct rusage ru_start, ru_end;
+    // Estimate algorithm's memory footprint
+    size_t cipher_struct_size = sizeof(SimSpk_Cipher); // Size of cipher object
+    size_t key_size = KEY_SIZE;                        // Key buffer
+    size_t iv_size = BLOCK_SIZE;                       // IV buffer
+    size_t pt_size = pad_len;                          // Plaintext buffer
+    size_t ct_size = pad_len;                          // Ciphertext buffer
+    size_t dt_size = pad_len;                          // Decrypted text buffer
+    size_t total_algo_memory = cipher_struct_size + key_size + iv_size + pt_size + ct_size + dt_size;
+
+    // Measure CPU time and memory for encryption
+    struct rusage ru_start, ru_enc, ru_end;
     getrusage(RUSAGE_SELF, &ru_start);
     auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -71,7 +79,7 @@ int main(int argc, char *argv[])
         }
     }
     auto t1 = std::chrono::high_resolution_clock::now();
-    getrusage(RUSAGE_SELF, &ru_end);
+    getrusage(RUSAGE_SELF, &ru_enc);
 
     // Decryption benchmark
     auto t2 = std::chrono::high_resolution_clock::now();
@@ -93,6 +101,7 @@ int main(int argc, char *argv[])
         }
     }
     auto t3 = std::chrono::high_resolution_clock::now();
+    getrusage(RUSAGE_SELF, &ru_end);
 
     // Calculate metrics
     double enc_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
@@ -105,8 +114,12 @@ int main(int argc, char *argv[])
     // CPU usage for encryption
     double wall_enc_s = std::chrono::duration<double>(t1 - t0).count();
     double cpu_start = ru_start.ru_utime.tv_sec + ru_start.ru_utime.tv_usec / 1e6 + ru_start.ru_stime.tv_sec + ru_start.ru_stime.tv_usec / 1e6;
-    double cpu_end = ru_end.ru_utime.tv_sec + ru_end.ru_utime.tv_usec / 1e6 + ru_end.ru_stime.tv_sec + ru_end.ru_stime.tv_usec / 1e6;
-    double cpu_usage_enc = ((cpu_end - cpu_start) / wall_enc_s) * 100.0;
+    double cpu_enc = ru_enc.ru_utime.tv_sec + ru_enc.ru_utime.tv_usec / 1e6 + ru_enc.ru_stime.tv_sec + ru_enc.ru_stime.tv_usec / 1e6;
+    double cpu_usage_enc = ((cpu_enc - cpu_start) / wall_enc_s) * 100.0;
+
+    // Memory usage
+    long ram_enc_peak = ru_enc.ru_maxrss * 1024; // Convert KB to bytes
+    long ram_dec_peak = ru_end.ru_maxrss * 1024; // Convert KB to bytes
 
     // Output metrics
     std::cout << "Enc=" << enc_us << " us\n"
@@ -115,7 +128,10 @@ int main(int argc, char *argv[])
               << "AvgDec=" << avg_dec << " us\n"
               << "ThroughputEnc=" << tp_enc << " B/s\n"
               << "ThroughputDec=" << tp_dec << " B/s\n"
-              << "CPUUsageEnc=" << cpu_usage_enc << "%\n";
+              << "CPUUsageEnc=" << cpu_usage_enc << "%\n"
+              << "PeakRAMEnc=" << ram_enc_peak << " bytes\n"
+              << "PeakRAMDec=" << ram_dec_peak << " bytes\n"
+              << "EstimatedAlgoRAM=" << total_algo_memory << " bytes\n";
 
     return 0;
 }
