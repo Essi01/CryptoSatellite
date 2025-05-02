@@ -556,20 +556,21 @@ void uint64ToBytes(uint64_t value, uint8_t* bytes) {
   }
 }
 
-// Rotation functions
+// Mer kompakt og effektiv rotasjonsfunksjon
 inline uint64_t rotl(uint64_t x, unsigned int n) {
-  return (x << n) | (x >> (64 - n));
+    return (x << n) | (x >> (64 - n));
 }
 
 inline uint64_t rotr(uint64_t x, unsigned int n) {
-  return (x >> n) | (x << (64 - n));
+    return (x >> n) | (x << (64 - n));
 }
 
-// SPECK round function for encryption
-#define ER64(x,y,k) (x=rotr(x,8), x+=y, x^=k, y=rotl(y,3), y^=x)
+// Mer effektiv runde-funksjon
+#define ER64(x,y,k) \
+    (x = rotr(x,8), x += y, x ^= k, y = rotl(y,3), y ^= x)
 
-// SPECK round function for decryption
-#define DR64(x,y,k) (y^=x, y=rotr(y,3), x^=k, x-=y, x=rotl(x,8))
+#define DR64(x,y,k) \
+    (y ^= x, y = rotr(y,3), x ^= k, x -= y, x = rotl(x,8))
 
 // SPECK encrypt block
 void speck_encrypt_block(uint64_t* block, const uint64_t* round_keys, int rounds) {
@@ -599,36 +600,34 @@ void speck_decrypt_block(uint64_t* block, const uint64_t* round_keys, int rounds
 
 // SPECK key schedule for 128/128
 void speck_key_schedule(const uint8_t* key, uint64_t* round_keys, int rounds) {
-  uint64_t b = bytesToUInt64(key + 8);
-  uint64_t a = bytesToUInt64(key);
-  
-  round_keys[0] = a;
-  
-  for (int i = 0; i < rounds - 1; i++) {
-    ER64(b, a, i);
-    round_keys[i + 1] = a;
-  }
+    uint64_t b = bytesToUInt64(key + 8);
+    uint64_t a = bytesToUInt64(key);
+    
+    round_keys[0] = a;
+    
+    for (int i = 0; i < rounds - 1; i++) {
+        ER64(b, a, i);
+        round_keys[i + 1] = a;
+    }
 }
 
 // Pad data to 16-byte blocks (SPECK block size)
 size_t padData(const char* input, unsigned char* output, size_t len) {
-  size_t padded_len = ((len + 15) / 16) * 16;  // Round up to nearest 16
-  
-  // Copy original data
-  memcpy(output, input, len);
-  
-  // Add padding (PKCS#7)
-  unsigned char pad_value = padded_len - len;
-  if (pad_value == 0) {
-    pad_value = 16; // If len is exactly a multiple of block size, add a full block
-    padded_len += 16;
-  }
-  
-  for (size_t i = len; i < padded_len; i++) {
-    output[i] = pad_value;
-  }
-  
-  return padded_len;
+    size_t padded_len = ((len + 15) / 16) * 16;  
+    
+    memcpy(output, input, len);
+    
+    unsigned char pad_value = padded_len - len;
+    if (pad_value == 0) {
+        pad_value = 16; 
+        padded_len += 16;
+    }
+    
+    for (size_t i = len; i < padded_len; i++) {
+        output[i] = pad_value;
+    }
+    
+    return padded_len;
 }
 
 // Remove padding

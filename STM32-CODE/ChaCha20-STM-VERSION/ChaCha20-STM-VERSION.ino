@@ -1,41 +1,14 @@
 #include <Arduino.h>
-#include <SerialRPC.h>
-#ifdef ARDUINO_ARCH_MBED
-#include "mbed_stats.h"
-#include "mbed.h"
-#include "rtos/rtos.h"
-#endif
-
-#include <limits.h> // Include for ULONG_MAX
-
-// If ULONG_MAX is still not defined, define it manually
-#ifndef ULONG_MAX
-#define ULONG_MAX 0xFFFFFFFFUL // Maximum value for 32-bit unsigned long
-#endif
-
-// Bare definer USE_MULTICORE_RTOS hvis vi er på dual-core
-#if defined(ARDUINO_ARCH_MBED) && defined(CORE_CM4) && defined(CORE_CM7)
-#define USE_MULTICORE_RTOS
-#define CORE_CRYPTO 1  // M7 core
-#define CORE_POWER  0  // M4 core
-#endif
-
-// Power monitoring configuration - using INA226
-#define USE_INA226
-
-#ifdef USE_INA226
 #include <Wire.h>
 #include <INA226_WE.h>
-#define INA226_I2C_ADDRESS 0x40    // Default I2C address (0x40)
-#define SHUNT_RESISTOR_VALUE 0.1   // 0.1 ohm shunt resistor (adjust to your actual value)
-#define MAX_CURRENT 1.0            // Maximum current to measure in amperes
-INA226_WE ina226(INA226_I2C_ADDRESS);  // Initialize with I2C address
+#include <climits>
+
+// Platform detection - now includes STM32
+#if defined(STM32_SERIES) || defined(STM32F4xx) || defined(STM32H7xx) || defined(STM32L4xx) || defined(HAL_STM32) || defined(ARDUINO_ARCH_STM32)
+#define IS_STM32_BOARD
 #endif
 
-// Add debug timing define
-#define BENCHMARK_TIMING_DEBUG false  // Set to false to hide individual timing details
-
-// Algorithm identification and measurement constants
+// Algorithm identification
 #define ALGORITHM_NAME "ChaCha20"
 bool detailed_memory_tracking = false;  // Variable that can be changed during runtime
 
@@ -85,35 +58,11 @@ const uint8_t test_keystream[16] = {
 #define BENCHMARK_IDLE false
 #define BENCHMARK_RUNNING true
 
-// RTOS related variables and mutexes
-#ifdef USE_MULTICORE_RTOS
-rtos::Thread power_thread;
-rtos::Thread crypto_thread;
-rtos::Mutex power_mutex;  // To protect shared power data
-rtos::Mutex benchmark_mutex; // To protect benchmark state
-rtos::Mutex serial_mutex;  // NEW: To protect Serial output from mixing
-rtos::Semaphore crypto_semaphore(0); // Signal to start crypto operations
-rtos::Semaphore power_semaphore(0);  // Signal to start power measurements
-
-// Flags for thread synchronization
-volatile bool crypto_active = false;
-volatile bool power_thread_running = false;
-volatile bool benchmark_mode = false;
-volatile bool single_measurement_mode = false;
-
-// Power measurement buffer
-#define MAX_POWER_SAMPLES 200
-struct PowerSample {
-  unsigned long timestamp;  // Timestamp in ms
-  float current_mA;         // Current in mA
-  float voltage_V;          // Voltage in V
-  float power_mW;           // Power in mW
-};
-
-PowerSample power_samples[MAX_POWER_SAMPLES];
-volatile int power_sample_count = 0;
-#define POWER_SAMPLE_INTERVAL_MS 10  // Higher frequency for RTOS implementation
-#endif
+// INA226 power monitor
+#define INA226_I2C_ADDRESS 0x40    // Default I2C address (0x40)
+#define SHUNT_RESISTOR_VALUE 0.1   // 0.1 ohm shunt resistor
+#define MAX_CURRENT 1.0            // Maximum current to measure in amperes
+INA226_WE ina226(INA226_I2C_ADDRESS);  // Initialize with I2C address
 
 // Benchmark state variables
 bool benchmark_state = BENCHMARK_IDLE;
@@ -131,16 +80,14 @@ unsigned long benchmark_total_eval_time = 0;
 unsigned long benchmark_start_time = 0;
 String benchmark_text = "";
 
-// Energimåling variabler
-#ifdef USE_INA226
+// Energy measurement variables
 float benchmark_total_energy = 0.0;
 int benchmark_energy_samples = 0;
 float benchmark_avg_current = 0.0;
 float benchmark_max_current = 0.0;
 float benchmark_min_current = 9999.0;
 unsigned long benchmark_last_energy_sample = 0;
-const unsigned long ENERGY_SAMPLE_INTERVAL = 100; // Sample hver 100ms for non-RTOS mode
-#endif
+const unsigned long ENERGY_SAMPLE_INTERVAL = 100; // Sample every 100ms
 
 // Memory management metrics
 unsigned long used_ram = 0;
@@ -163,78 +110,53 @@ unsigned long encrypt(const unsigned char* input, unsigned char* output, size_t 
 unsigned long decrypt(const unsigned char* input, unsigned char* output, size_t len);
 unsigned long safeTimeDiff(unsigned long start, unsigned long end);
 
-// Memory management functions
-#ifdef ARDUINO_ARCH_MBED
-int freeRam() {
-    mbed_stats_heap_t stats;
-    mbed_stats_heap_get(&stats);
-    return stats.reserved_size - stats.current_size;
+// Custom min function to solve type conflicts
+template <typename T1, typename T2>
+inline auto minimum(T1 a, T2 b) -> decltype(a < b ? a : b) {
+  return (a < b) ? a : b;
 }
 
-// Memory measurement function
+// Custom max function to solve type conflicts
+template <typename T1, typename T2>
+inline auto maximum(T1 a, T2 b) -> decltype(a > b ? a : b) {
+  return (a > b) ? a : b;
+}
+
+// STM32-specific memory function
+int freeRam() {
+  // Simplified memory measurement for STM32
+  char stack_dummy;
+  static char* heap_end = 0;
+  extern char _estack; // Top of stack
+  extern char _end;    // End of .bss section, start of heap
+  
+  if (heap_end == 0) {
+    heap_end = &_end;
+  }
+  
+  return &_estack - heap_end;
+}
+
 void measureMemory(const char* label) {
-  mbed_stats_heap_t heap_stats;
-  mbed_stats_stack_t stack_stats;
-  
-  mbed_stats_heap_get(&heap_stats);
-  mbed_stats_stack_get(&stack_stats);
-  
-  // Store metrics for decision matrix
-  used_ram = heap_stats.current_size + stack_stats.max_size;
-  total_ram = heap_stats.reserved_size;
-  max_stack = stack_stats.max_size;
+  int free_ram_bytes = freeRam();
   
   // Skip detailed metrics if not in detailed mode and not a summary label
   if (strstr(label, "Step") != NULL && !detailed_memory_tracking) {
     return;
   }
   
-  // Print memory information
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.lock();
-  #endif
-  
   Serial.print("MEMORY [");
   Serial.print(label);
-  Serial.print("]: Heap ");
-  Serial.print(heap_stats.current_size);
-  Serial.print("/");
-  Serial.print(heap_stats.reserved_size);
-  Serial.print(" bytes, Free: ");
-  Serial.print(heap_stats.reserved_size - heap_stats.current_size);
-  Serial.print(" bytes, Stack max: ");
-  Serial.print(stack_stats.max_size);
+  Serial.print("]: Free RAM (estimated): ");
+  Serial.print(free_ram_bytes);
   Serial.println(" bytes");
-  
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.unlock();
-  #endif
 }
 
-// Generate decision matrix data report with verification
+// Generate decision matrix data report
 void generateMatrixReport() {
-#ifdef ARDUINO_ARCH_MBED
-  mbed_stats_heap_t heap_stats;
-  mbed_stats_stack_t stack_stats;
-  
-  mbed_stats_heap_get(&heap_stats);
-  mbed_stats_stack_get(&stack_stats);
-  
-  used_ram = heap_stats.current_size + stack_stats.max_size;
-#else
-  // For non-MBED platforms, use the available free RAM metric
+  // Store memory information
   int free_ram = freeRam();
-  // This is approximate since we don't know total RAM on all platforms
-  used_ram = MAX_SIZE * 3; // Estimate based on our buffer sizes
-#endif
-  
-  // Calculate per-byte latency (more informative for decision matrix)
-  float enc_latency_per_byte = avgEnc / (float)benchmark_padded_len; // µs per byte
-  float dec_latency_per_byte = avgDec / (float)benchmark_padded_len; // µs per byte
-  
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.lock();
-  #endif
+  used_ram = MAX_SIZE * 3 + 2048; // Approximate based on static buffers
   
   Serial.println("\n==========================================");
   Serial.println("        DECISION MATRIX DATA             ");
@@ -261,7 +183,6 @@ void generateMatrixReport() {
   Serial.print(avgDec, 2);
   Serial.println(" µs");
   
-  // Include per-byte latency in comments for reference
   Serial.print("Encryption Throughput: ");
   Serial.print(encrypt_throughput);
   Serial.println(" bytes/s");
@@ -278,227 +199,47 @@ void generateMatrixReport() {
   Serial.print(decrypt_goodput);
   Serial.println(" bytes/s");
   
-  // Calculate overhead percentage for stream cipher
+  // Calculate overhead percentage
   float enc_overhead_pct = 100.0 * (1.0 - ((float)benchmark_input_len / benchmark_padded_len));
   Serial.print("Protocol Overhead: ");
   Serial.print(enc_overhead_pct, 1);
   Serial.println("%");
   
-  #ifdef USE_INA226
-  #ifdef USE_MULTICORE_RTOS
-  power_mutex.lock();
-  // Calculate average power from samples
-  float avg_current = 0;
-  float avg_power = 0;
-  float max_current = 0;
-  float min_current = 9999.0;
+  Serial.print("Current (avg): ");
+  Serial.print(benchmark_avg_current, 2);
+  Serial.println(" mA");
   
-  if (power_sample_count > 0) {
-    for (int i = 0; i < power_sample_count; i++) {
-      avg_current += power_samples[i].current_mA;
-      avg_power += power_samples[i].power_mW;
-      max_current = max(max_current, power_samples[i].current_mA);
-      min_current = min(min_current, power_samples[i].current_mA);
-    }
-    avg_current /= power_sample_count;
-    avg_power /= power_sample_count;
-    
-// Calculate energy in mJ (current in mA * time in s * voltage in V)
-float total_time_s = (power_samples[power_sample_count-1].timestamp - 
-                     power_samples[0].timestamp) / 1000.0;
-float total_energy = avg_current * total_time_s * 5.0; // Assuming 5V supply voltage
-    
-    Serial.print("Current (avg): ");
-    Serial.print(avg_current, 2);
-    Serial.println(" mA");
+  if (benchmark_min_current < 9999.0 && benchmark_max_current > 0) {
     Serial.print("Current (range): ");
-    Serial.print(min_current, 2);
+    Serial.print(benchmark_min_current, 2);
     Serial.print(" - ");
-    Serial.print(max_current, 2);
+    Serial.print(benchmark_max_current, 2);
     Serial.println(" mA");
-    Serial.print("Energy: ");
-    Serial.print(total_energy, 2);
-    Serial.println(" mJ");
-  } else {
-    Serial.println("Current: No samples collected");
-    Serial.println("Energy: No samples collected");
   }
-  power_mutex.unlock();
-  #else
-  Serial.print("Current: ");
-  Serial.print(benchmark_avg_current, 2);
-  Serial.println(" mA");
+  
   Serial.print("Energy: ");
   Serial.print(benchmark_total_energy, 2);
   Serial.println(" mJ");
-  #endif
-  #else
-  Serial.println("Current: [External measurement required]");
-  Serial.println("Power: [External measurement required]");
-  #endif
-  
-  Serial.println("Security Strength: 256-bit");
-  Serial.println("Error Propagation: None (stream cipher)");
-  Serial.println("==========================================");
-  
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.unlock();
-  #endif
-}
-#else
-int freeRam() {
-  extern char __heap_start, *__brkval;
-  int v;
-  return (int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
-}
-
-// Memory measurement function for non-MBED
-void measureMemory(const char* label) {
-  int free_ram = freeRam();
-  
-  // Skip detailed metrics if not in detailed mode and not a summary label
-  if (strstr(label, "Step") != NULL && !detailed_memory_tracking) {
-    return;
-  }
-  
-  Serial.print("MEMORY [");
-  Serial.print(label);
-  Serial.print("]: Free RAM: ");
-  Serial.print(free_ram);
-  Serial.println(" bytes");
-}
-
-// Simple matrix report for non-MBED platforms
-void generateMatrixReport() {
-  Serial.println("\n==========================================");
-  Serial.println("        DECISION MATRIX DATA             ");
-  Serial.println("==========================================");
-  Serial.print("Algorithm: ");
-  Serial.println(ALGORITHM_NAME);
-  
-  Serial.print("RAM Usage: [See memory measurements]");
-  Serial.println("ROM/FLASH memory: [See compiler output]");
-  
-  Serial.print("CPU Usage: ");
-  Serial.print(cpu_usage, 2);
-  Serial.println("%");
-  
-  Serial.print("Encryption Latency: ");
-  Serial.print(avgEnc, 2);
-  Serial.println(" µs");
-  
-  Serial.print("Decryption Latency: ");
-  Serial.print(avgDec, 2);
-  Serial.println(" µs");
-  
-  Serial.print("Encryption Throughput: ");
-  Serial.print(encrypt_throughput);
-  Serial.println(" bytes/s");
-  
-  Serial.print("Decryption Throughput: ");
-  Serial.print(decrypt_throughput);
-  Serial.println(" bytes/s");
-  
-  Serial.print("Encryption Goodput: ");
-  Serial.print(encrypt_goodput);
-  Serial.println(" bytes/s");
-  
-  Serial.print("Decryption Goodput: ");
-  Serial.print(decrypt_goodput);
-  Serial.println(" bytes/s");
-  
-  #ifdef USE_INA226
-  Serial.print("Current: ");
-  Serial.print(benchmark_avg_current, 2);
-  Serial.println(" mA");
-  Serial.print("Energy: ");
-  Serial.print(benchmark_total_energy, 2);
-  Serial.println(" mJ");
-  #else
-  Serial.println("Current: [External measurement required]");
-  Serial.println("Power: [External measurement required]");
-  #endif
   
   Serial.println("Security Strength: 256-bit");
   Serial.println("Error Propagation: None (stream cipher)");
   Serial.println("==========================================");
 }
-#endif
 
 // Read current power measurements and return
 void readCurrentPower(float &current_mA, float &bus_voltage, float &power_mW) {
-  #ifdef USE_INA226
   current_mA = ina226.getCurrent_mA();
   bus_voltage = ina226.getBusVoltage_V();
   power_mW = ina226.getBusPower() * 1000.0; // Convert W to mW
-  #else
-  current_mA = 0;
-  bus_voltage = 0;
-  power_mW = 0;
-  #endif
 }
 
 // Get INA226 power measurements
 void readPowerMeasurements() {
-  #ifdef USE_INA226
   float current_mA = 0;
   float bus_voltage = 0;
   float power_mW = 0;
   
-  #ifdef USE_MULTICORE_RTOS
-  power_mutex.lock();
-  if (power_sample_count > 0) {
-    // Get the last sample
-    current_mA = power_samples[power_sample_count-1].current_mA;
-    bus_voltage = power_samples[power_sample_count-1].voltage_V;
-    power_mW = power_samples[power_sample_count-1].power_mW;
-    
-    // Also calculate averages
-    float avg_current = 0;
-    float avg_power = 0;
-    for (int i = 0; i < power_sample_count; i++) {
-      avg_current += power_samples[i].current_mA;
-      avg_power += power_samples[i].power_mW;
-    }
-    avg_current /= power_sample_count;
-    avg_power /= power_sample_count;
-    
-    serial_mutex.lock();
-    Serial.println("\n==========================================");
-    Serial.println("         POWER MEASUREMENTS              ");
-    Serial.println("==========================================");
-    Serial.print("Current (instant): ");
-    Serial.print(current_mA, 2);
-    Serial.println(" mA");
-    Serial.print("Current (average): ");
-    Serial.print(avg_current, 2);
-    Serial.println(" mA");
-    Serial.print("Bus Voltage: ");
-    Serial.print(bus_voltage, 3);
-    Serial.println(" V");
-    Serial.print("Power (instant): ");
-    Serial.print(power_mW, 2);
-    Serial.println(" mW");
-    Serial.print("Power (average): ");
-    Serial.print(avg_power, 2);
-    Serial.println(" mW");
-    Serial.print("Samples: ");
-    Serial.println(power_sample_count);
-    Serial.println("==========================================");
-    serial_mutex.unlock();
-  } else {
-    serial_mutex.lock();
-    Serial.println("No power samples available. Starting measurement...");
-    serial_mutex.unlock();
-    // Start a single power measurement
-    single_measurement_mode = true;
-    if (!power_thread_running) {
-      startPowerMeasurement();
-    }
-  }
-  power_mutex.unlock();
-  #else
-  // Direct measurement in non-RTOS mode
+  // Direct measurement
   readCurrentPower(current_mA, bus_voltage, power_mW);
   
   Serial.println("\n==========================================");
@@ -516,10 +257,6 @@ void readPowerMeasurements() {
   Serial.print(power_mW, 2);
   Serial.println(" mW");
   Serial.println("==========================================");
-  #endif
-  #else
-  Serial.println("INA226 power monitoring not enabled");
-  #endif
 }
 
 // Helper function to display bytes as hex
@@ -538,8 +275,6 @@ void generateNonce(unsigned char* nonce) {
     nonce[i] = random(256);
   }
 }
-
-// ChaCha20 helper functions
 
 // Rotate left (circular left shift)
 inline uint32_t rotl32(uint32_t x, int n) {
@@ -568,7 +303,7 @@ void chacha20_quarter_round(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) 
   c += d; b ^= c; b = rotl32(b, 7);
 }
 
-// The ChaCha20 block function (20 rounds = 10 column + 10 diagonal rounds)
+// The ChaCha20 block function
 void chacha20_block(uint32_t* state, uint32_t* output) {
   // Copy input state to working state
   uint32_t x[16];
@@ -639,8 +374,8 @@ void chacha20_keystream(uint32_t* state, unsigned char* keystream, size_t len) {
       U32TO8_LITTLE(block + (i * 4), output[i]);
     }
     
-    // Copy keystream to output
-    size_t block_size = min(64, len - offset);
+    // Copy keystream to output - Using our custom minimum function
+    size_t block_size = minimum<size_t, size_t>(64, len - offset);
     memcpy(keystream + offset, block, block_size);
     
     // Increment counter for next block
@@ -672,8 +407,8 @@ void chacha20_encrypt_decrypt(const unsigned char* input, unsigned char* output,
       U32TO8_LITTLE(keystream + (i * 4), ((uint32_t*)keystream)[i]);
     }
     
-    // XOR input with keystream
-    size_t chunk_size = min(64, len - offset);
+    // XOR input with keystream - Using our custom minimum function
+    size_t chunk_size = minimum<size_t, size_t>(64, len - offset);
     for (size_t i = 0; i < chunk_size; i++) {
       output[offset + i] = input[offset + i] ^ keystream[i];
     }
@@ -716,22 +451,20 @@ size_t removePadding(unsigned char* data, size_t len) {
   return len - padding_value;
 }
 
+// Safe subtraction function to handle timer overflows
+unsigned long safeTimeDiff(unsigned long start, unsigned long end) {
+  // Handle timer overflow
+  if (end >= start) {
+    return end - start;
+  } else {
+    // Overflow occurred
+    return (0xFFFFFFFF - start) + end + 1;
+  }
+}
+
 // Encrypt data with ChaCha20 (with IV/nonce generation)
-// Returns the actual execution time in microseconds
 unsigned long encrypt(const unsigned char* input, unsigned char* output, size_t len) {
   if (detailed_memory_tracking) measureMemory("Step 1: Before Encryption");
-  
-  #ifdef USE_MULTICORE_RTOS
-  // Notify power measurement thread that we're about to start encryption
-  // but only if we're not in benchmark mode (that's handled separately)
-  if (!benchmark_mode && !crypto_active) {
-    crypto_active = true;
-    power_mutex.lock();
-    power_sample_count = 0; // Reset samples
-    power_mutex.unlock();
-    power_semaphore.release(); // Signal power thread to start measuring
-  }
-  #endif
   
   // Measure time more accurately by running multiple iterations for short operations
   const int MIN_ACCURATE_MICROS = 100; // Minimum time for accurate measurement
@@ -779,46 +512,12 @@ unsigned long encrypt(const unsigned char* input, unsigned char* output, size_t 
   
   if (detailed_memory_tracking) measureMemory("Step 3: End of Encryption");
   
-  #ifdef USE_MULTICORE_RTOS
-  // Notify power measurement that we're done with encryption
-  // but only if we're not in benchmark mode
-  if (!benchmark_mode && crypto_active) {
-    crypto_active = false;
-  }
-  #endif
-  
-  // For accurate benchmark reporting
-  #if BENCHMARK_TIMING_DEBUG
-  if (iterations > 1) {
-    serial_mutex.lock();
-    Serial.print("Encryption timing: Used ");
-    Serial.print(iterations);
-    Serial.print(" iterations for accurate measurement. Average: ");
-    Serial.print(avg_time);
-    Serial.println(" µs");
-    serial_mutex.unlock();
-  }
-  #endif
-  
   return avg_time;
 }
 
 // Decrypt data with ChaCha20
-// Returns the actual execution time in microseconds
 unsigned long decrypt(const unsigned char* input, unsigned char* output, size_t len) {
   if (detailed_memory_tracking) measureMemory("Step 1: Before Decryption");
-  
-  #ifdef USE_MULTICORE_RTOS
-  // Notify power measurement thread that we're about to start decryption
-  // but only if we're not in benchmark mode (that's handled separately)
-  if (!benchmark_mode && !crypto_active) {
-    crypto_active = true;
-    power_mutex.lock();
-    power_sample_count = 0; // Reset samples
-    power_mutex.unlock();
-    power_semaphore.release(); // Signal power thread to start measuring
-  }
-  #endif
   
   // Measure time more accurately by running multiple iterations for short operations
   const int MIN_ACCURATE_MICROS = 100; // Minimum time for accurate measurement
@@ -867,27 +566,6 @@ unsigned long decrypt(const unsigned char* input, unsigned char* output, size_t 
   
   if (detailed_memory_tracking) measureMemory("Step 3: End of Decryption");
   
-  #ifdef USE_MULTICORE_RTOS
-  // Notify power measurement that we're done with decryption
-  // but only if we're not in benchmark mode
-  if (!benchmark_mode && crypto_active) {
-    crypto_active = false;
-  }
-  #endif
-  
-  // For accurate benchmark reporting
-  #if BENCHMARK_TIMING_DEBUG
-  if (iterations > 1) {
-    serial_mutex.lock();
-    Serial.print("Decryption timing: Used ");
-    Serial.print(iterations);
-    Serial.print(" iterations for accurate measurement. Average: ");
-    Serial.print(avg_time);
-    Serial.println(" µs");
-    serial_mutex.unlock();
-  }
-  #endif
-  
   return avg_time;
 }
 
@@ -904,31 +582,12 @@ void removeSpaces(const char* str, char* result) {
   result[j] = '\0';
 }
 
-// Safe subtraction function to handle timer overflows
-unsigned long safeTimeDiff(unsigned long start, unsigned long end) {
-  // Handle timer overflow
-  if (end >= start) {
-    return end - start;
-  } else {
-    // Overflow occurred
-    return (0xFFFFFFFF - start) + end + 1;
-  }
-}
-
 // Validate ChaCha20 implementation against test vector
 bool validate_chacha20() {
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.lock();
-  #endif
-  
   Serial.println("\n==========================================");
   Serial.println("         VALIDATION TEST                 ");
   Serial.println("==========================================");
   Serial.println("Validating ChaCha20 implementation against test vectors...");
-  
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.unlock();
-  #endif
   
   // Set up test state
   uint32_t state[16];
@@ -944,22 +603,16 @@ bool validate_chacha20() {
     if (keystream[i] != test_keystream[i]) {
       keystream_match = false;
       
-      #ifdef USE_MULTICORE_RTOS
-      serial_mutex.lock();
-      #endif
-      
       Serial.print("Keystream mismatch at byte ");
       Serial.print(i);
       Serial.print(": Expected ");
       Serial.print(test_keystream[i], HEX);
       Serial.print(", Got ");
       Serial.println(keystream[i], HEX);
-      
-      #ifdef USE_MULTICORE_RTOS
-      serial_mutex.unlock();
-      #endif
     }
   }
+
+  
   
   // Test encryption and decryption
   const char* test_plaintext = "The quick brown fox jumps over the lazy dog";
@@ -980,10 +633,6 @@ bool validate_chacha20() {
   bool decrypt_match = (memcmp(decrypted, test_plaintext, test_len) == 0);
   
   // Report results
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.lock();
-  #endif
-  
   if (keystream_match && decrypt_match) {
     Serial.println("Validation SUCCESSFUL! ChaCha20 implementation is correct.");
   } else {
@@ -992,10 +641,6 @@ bool validate_chacha20() {
     Serial.print("Decrypt match: "); Serial.println(decrypt_match ? "YES" : "NO");
   }
   Serial.println("==========================================");
-  
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.unlock();
-  #endif
   
   return keystream_match && decrypt_match;
 }
@@ -1066,143 +711,7 @@ int evaluerUttrykk(const char* expr) {
   return 0; // Not a recognized expression
 }
 
-#ifdef USE_MULTICORE_RTOS
-// Power measurement thread function
-void powerMeasurementThread() {
-  // Pin this thread to second core (M4)
-  #if defined(ARDUINO_ARCH_MBED) && defined(RTOS_VERSION)
-  // Use the correct method based on platform
-  rtos::ThisThread::priority(osPriorityHigh);
-  #endif
-  
-  serial_mutex.lock();
-  Serial.println("Power measurement thread started on core M4");
-  serial_mutex.unlock();
-  
-  while (true) {
-    // Wait for signal to start measuring
-    power_semaphore.acquire();
-    
-    power_mutex.lock();
-    power_thread_running = true;
-    power_sample_count = 0;
-    power_mutex.unlock();
-    
-    serial_mutex.lock();
-    Serial.println("Starting power measurements...");
-    serial_mutex.unlock();
-    
-    // Continuous measurement while crypto is active or in single measurement mode
-    while ((crypto_active || single_measurement_mode) && power_sample_count < MAX_POWER_SAMPLES) {
-      float current_mA, bus_voltage, power_mW;
-      readCurrentPower(current_mA, bus_voltage, power_mW);
-      
-      power_mutex.lock();
-      if (power_sample_count < MAX_POWER_SAMPLES) {
-        power_samples[power_sample_count].timestamp = millis();
-        power_samples[power_sample_count].current_mA = current_mA;
-        power_samples[power_sample_count].voltage_V = bus_voltage;
-        power_samples[power_sample_count].power_mW = power_mW;
-        power_sample_count++;
-        
-        // If in single measurement mode, collect a few samples then stop
-        if (single_measurement_mode && power_sample_count >= 10) {
-          single_measurement_mode = false;
-        }
-      }
-      power_mutex.unlock();
-      
-      // Sample at higher frequency in thread mode
-      rtos::ThisThread::sleep_for(POWER_SAMPLE_INTERVAL_MS);
-    }
-    
-    // Print summary if we have samples
-    power_mutex.lock();
-    if (power_sample_count > 0) {
-      float avg_current = 0;
-      float max_current = 0;
-      float min_current = 9999.0;
-      
-      for (int i = 0; i < power_sample_count; i++) {
-        avg_current += power_samples[i].current_mA;
-        max_current = max(max_current, power_samples[i].current_mA);
-        min_current = min(min_current, power_samples[i].current_mA);
-      }
-      avg_current /= power_sample_count;
-      
-      serial_mutex.lock();
-      Serial.print("Power measurement complete. Collected ");
-      Serial.print(power_sample_count);
-      Serial.print(" samples, Avg current: ");
-      Serial.print(avg_current, 2);
-      Serial.print(" mA, Range: ");
-      Serial.print(min_current, 2);
-      Serial.print(" - ");
-      Serial.print(max_current, 2);
-      Serial.println(" mA");
-      serial_mutex.unlock();
-    } else {
-      serial_mutex.lock();
-      Serial.println("Power measurement complete. No samples collected.");
-      serial_mutex.unlock();
-    }
-    
-    power_thread_running = false;
-    power_mutex.unlock();
-  }
-}
-
-// Benchmark processing thread
-void cryptoBenchmarkThread() {
-  // Pin this thread to first core (M7)
-  #if defined(ARDUINO_ARCH_MBED) && defined(RTOS_VERSION)
-  // Use the correct method based on platform
-  rtos::ThisThread::priority(osPriorityNormal);
-  #endif
-  
-  serial_mutex.lock();
-  Serial.println("Crypto benchmark thread started on core M7");
-  serial_mutex.unlock();
-  
-  while (true) {
-    // Wait for signal to start benchmark processing
-    crypto_semaphore.acquire();
-    
-    serial_mutex.lock();
-    Serial.println("Starting crypto benchmark processing...");
-    serial_mutex.unlock();
-    
-    // Run benchmark process on this thread
-    while (benchmark_state == BENCHMARK_RUNNING) {
-      benchmark_mutex.lock();
-      processBenchmarkChunk();
-      benchmark_mutex.unlock();
-      
-      // Brief yield to allow other tasks to run
-      rtos::ThisThread::sleep_for(1);
-    }
-    
-    serial_mutex.lock();
-    Serial.println("Benchmark processing complete.");
-    serial_mutex.unlock();
-  }
-}
-
-// Helper function to start power measurement
-void startPowerMeasurement() {
-  power_semaphore.release();
-}
-
-// Helper function to start benchmark in RTOS mode
-void startBenchmarkRTOS() {
-  benchmark_mode = true;
-  crypto_active = true;
-  startPowerMeasurement();
-  crypto_semaphore.release();
-}
-#endif
-
-// Initialize benchmark with improved metrics collection
+// Initialize benchmark
 void startBenchmark(String text, long repeats) {
   // Measure memory before benchmark
   measureMemory("Before Benchmark");
@@ -1225,26 +734,18 @@ void startBenchmark(String text, long repeats) {
   benchmark_total_decrypt_time = 0;
   benchmark_total_eval_time = 0;
   
-  #ifdef USE_INA226
-  #ifndef USE_MULTICORE_RTOS
   benchmark_total_energy = 0.0;
   benchmark_energy_samples = 0;
   benchmark_avg_current = 0.0;
   benchmark_max_current = 0.0;
   benchmark_min_current = 9999.0;
   benchmark_last_energy_sample = 0;
-  #endif
-  #endif
   
   // Start timing for the entire benchmark
   benchmark_start_time = millis();
   
   // Set benchmark state to running
   benchmark_state = BENCHMARK_RUNNING;
-  
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.lock();
-  #endif
   
   Serial.println("\n==========================================");
   Serial.println("         BENCHMARK STARTED                ");
@@ -1261,26 +762,14 @@ void startBenchmark(String text, long repeats) {
   Serial.println(" bytes)");
   Serial.println("(You can send new commands while benchmark is running)");
   Serial.println("Send 'STOP' to abort benchmark");
-  
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.unlock();
-  
-  // Reset power sample buffer
-  power_mutex.lock();
-  power_sample_count = 0;
-  power_mutex.unlock();
-  
-  // Start benchmark in RTOS mode
-  startBenchmarkRTOS();
-  #endif
 }
 
-// Process a chunk of benchmark iterations with statistical validation
+// Process a chunk of benchmark iterations
 void processBenchmarkChunk() {
   if (benchmark_state != BENCHMARK_RUNNING) return;
   
   unsigned long start_time, end_time, encrypt_time, decrypt_time;
-  int chunk_size = min(BENCHMARK_CHUNK_SIZE, benchmark_total_iterations - benchmark_current_iteration);
+  int chunk_size = minimum<int, long>(BENCHMARK_CHUNK_SIZE, benchmark_total_iterations - benchmark_current_iteration);
   bool report_progress = false;
   
   // For statistical validation
@@ -1295,8 +784,8 @@ void processBenchmarkChunk() {
     benchmark_total_encrypt_time += encrypt_time;
     
     // Track min/max for statistical validation
-    min_encrypt_time = min(min_encrypt_time, encrypt_time);
-    max_encrypt_time = max(max_encrypt_time, encrypt_time);
+    min_encrypt_time = minimum(min_encrypt_time, encrypt_time);
+    max_encrypt_time = maximum(max_encrypt_time, encrypt_time);
     
     // Verify encryption result by decrypting and comparing (every 500th iteration to save time)
     if (benchmark_current_iteration % 500 == 0) {
@@ -1313,15 +802,7 @@ void processBenchmarkChunk() {
       }
       
       if (!encryption_verified) {
-        #ifdef USE_MULTICORE_RTOS
-        serial_mutex.lock();
-        #endif
-        
         Serial.println("\nWARNING: Encryption verification failed! Results may be invalid.");
-        
-        #ifdef USE_MULTICORE_RTOS
-        serial_mutex.unlock();
-        #endif
       }
     }
     
@@ -1330,8 +811,8 @@ void processBenchmarkChunk() {
     benchmark_total_decrypt_time += decrypt_time;
     
     // Track min/max for statistical validation
-    min_decrypt_time = min(min_decrypt_time, decrypt_time);
-    max_decrypt_time = max(max_decrypt_time, decrypt_time);
+    min_decrypt_time = minimum(min_decrypt_time, decrypt_time);
+    max_decrypt_time = maximum(max_decrypt_time, decrypt_time);
     
     // Evaluation (if the text is an expression)
     size_t actual_len = removePadding(benchmark_decrypted, benchmark_padded_len);
@@ -1357,10 +838,6 @@ void processBenchmarkChunk() {
   
   // Show progress if necessary
   if (report_progress) {
-    #ifdef USE_MULTICORE_RTOS
-    serial_mutex.lock();
-    #endif
-    
     Serial.print(".");
     if (benchmark_current_iteration % 10000 == 0) {
       Serial.print(" ");
@@ -1380,26 +857,18 @@ void processBenchmarkChunk() {
         Serial.println("%");
       }
     }
-    
-    #ifdef USE_MULTICORE_RTOS
-    serial_mutex.unlock();
-    #endif
   }
   
-  // Energimåling med sampling (non-RTOS mode only)
-  #ifdef USE_INA226
-  #ifndef USE_MULTICORE_RTOS
+  // Energy measurement with sampling
   unsigned long current_time = millis();
   if (current_time - benchmark_last_energy_sample >= ENERGY_SAMPLE_INTERVAL) {
     float current = ina226.getCurrent_mA();
     benchmark_avg_current += current;
-    benchmark_max_current = max(benchmark_max_current, current);
-    benchmark_min_current = min(benchmark_min_current, current);
+    benchmark_max_current = maximum(benchmark_max_current, current);
+    benchmark_min_current = minimum(benchmark_min_current, current);
     benchmark_energy_samples++;
     benchmark_last_energy_sample = current_time;
   }
-  #endif
-  #endif
   
   // Check if we're done
   if (benchmark_current_iteration >= benchmark_total_iterations) {
@@ -1407,62 +876,42 @@ void processBenchmarkChunk() {
   }
 }
 
-// Complete benchmark and report results with enhanced analysis
+// Complete benchmark and report results
 void finishBenchmark() {
   // End timing for the entire benchmark
   unsigned long benchmark_end = millis();
   unsigned long total_benchmark_time = safeTimeDiff(benchmark_start_time, benchmark_end);
   
-  #ifdef USE_MULTICORE_RTOS
-  // Stop crypto activity
-  crypto_active = false;
-  benchmark_mode = false;
-  #endif
-  
-  // Calculate actual CPU usage more accurately
-  // Convert microseconds to milliseconds for proper comparison
+  // Calculate actual CPU usage
   cpu_usage = (benchmark_total_encrypt_time + benchmark_total_decrypt_time) / 1000.0 / total_benchmark_time * 100.0;
   
-  // Calculate energy in non-RTOS mode
-  #ifdef USE_INA226
-  #ifndef USE_MULTICORE_RTOS
+  // Calculate energy
   if (benchmark_energy_samples > 0) {
     benchmark_avg_current /= benchmark_energy_samples;
-    // Beregn total energi i millijoule (mA * ms * V / 1000)
-    // Antar spenning på 5V for Arduino
+    // Calculate total energy in millijoule (mA * ms * V / 1000)
     float benchmark_seconds = total_benchmark_time / 1000.0;
-    benchmark_total_energy = benchmark_avg_current * benchmark_seconds * 5.0;
+    benchmark_total_energy = benchmark_avg_current * benchmark_seconds * 5.0; // Assume 5V
   }
-  #endif
-  #endif
   
   // Calculate total combined time and average
   unsigned long total_combined_time = benchmark_total_encrypt_time + benchmark_total_decrypt_time;
   float combined_average_time = total_combined_time / (float)(benchmark_total_iterations * 2);
   
-  // Phase 1: Calculate average times per operation
+  // Calculate per-byte latency
   avgEnc = benchmark_total_encrypt_time / (float)benchmark_total_iterations;
   avgDec = benchmark_total_decrypt_time / (float)benchmark_total_iterations;
   
-  // Phase 2: Calculate throughput (bytes per second)
+  // Calculate throughput (bytes per second)
   encrypt_throughput = (unsigned long)(benchmark_padded_len * 1e6 / avgEnc);
   decrypt_throughput = (unsigned long)(benchmark_padded_len * 1e6 / avgDec);
   
-  // Phase 3: Calculate goodput (effective bytes per second, excluding overhead)
+  // Calculate goodput (effective bytes per second, excluding overhead)
   encrypt_goodput = (unsigned long)(benchmark_input_len * 1e6 / avgEnc);
   decrypt_goodput = (unsigned long)(benchmark_input_len * 1e6 / avgDec);
   
-  // Calculate overhead and efficiency metrics
-  float overhead_bytes = (float)(benchmark_padded_len - benchmark_input_len);
-  float iv_overhead = (float)IV_SIZE; // IV + counter
-  float padding_overhead = overhead_bytes - iv_overhead;
+  // Calculate overhead percentage
   float protocol_overhead_pct = 100.0 * (1.0 - ((float)benchmark_input_len / benchmark_padded_len));
   
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.lock();
-  #endif
-  
-  // Report benchmark results with overall statistics
   Serial.println("\n==========================================");
   Serial.println("         BENCHMARK RESULTS               ");
   Serial.println("==========================================");
@@ -1530,43 +979,6 @@ void finishBenchmark() {
   Serial.print(protocol_overhead_pct, 1);
   Serial.println("%");
   
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.unlock();
-  #endif
-  
-  #ifdef USE_INA226
-  #ifdef USE_MULTICORE_RTOS
-  power_mutex.lock();
-  if (power_sample_count > 0) {
-    float avg_current = 0;
-    float max_current = 0;
-    float min_current = 9999.0;
-    
-    for (int i = 0; i < power_sample_count; i++) {
-      avg_current += power_samples[i].current_mA;
-      max_current = max(max_current, power_samples[i].current_mA);
-      min_current = min(min_current, power_samples[i].current_mA);
-    }
-    avg_current /= power_sample_count;
-    
-    serial_mutex.lock();
-    Serial.println("\n==========================================");
-    Serial.println("         POWER MEASUREMENTS              ");
-    Serial.println("==========================================");
-    Serial.print("Power samples collected: ");
-    Serial.println(power_sample_count);
-    Serial.print("Average current: ");
-    Serial.print(avg_current, 2);
-    Serial.println(" mA");
-    Serial.print("Current range: ");
-    Serial.print(min_current, 2);
-    Serial.print(" - ");
-    Serial.print(max_current, 2);
-    Serial.println(" mA");
-    serial_mutex.unlock();
-  }
-  power_mutex.unlock();
-  #else
   if (benchmark_energy_samples > 0) {
     Serial.println("\n==========================================");
     Serial.println("         POWER MEASUREMENTS              ");
@@ -1583,12 +995,6 @@ void finishBenchmark() {
     Serial.print(benchmark_total_energy, 2);
     Serial.println(" mJ");
   }
-  #endif
-  #endif
-  
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.lock();
-  #endif
   
   if (benchmark_total_eval_time > 0) {
     Serial.println("\n==========================================");
@@ -1608,7 +1014,9 @@ void finishBenchmark() {
   Serial.println("         DATA SAMPLES                    ");
   Serial.println("==========================================");
   Serial.print("Encrypted (first block with IV): ");
-  printHex(benchmark_encrypted, min(benchmark_padded_len + IV_SIZE, 32));
+  size_t display_bytes = benchmark_padded_len + IV_SIZE;
+  if (display_bytes > 32) display_bytes = 32;
+  printHex(benchmark_encrypted, display_bytes);
   
   Serial.print("Decrypted: ");
   Serial.println((char*)benchmark_decrypted);
@@ -1622,10 +1030,6 @@ void finishBenchmark() {
       Serial.println(result);
     }
   }
-  
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.unlock();
-  #endif
   
   // Generate decision matrix report
   generateMatrixReport();
@@ -1643,39 +1047,23 @@ void setup() {
   randomSeed(analogRead(0)); // Initialize random for nonce generation
   
   // Initialize INA226 power monitor
-  #ifdef USE_INA226
   Wire.begin();
   if (ina226.init()) {
-    // Configure INA226 with TWO parameters for each method
+    // Configure INA226
     ina226.setAverage(AVERAGE_1);
     ina226.setConversionTime(CONV_TIME_1100);
     ina226.setMeasureMode(CONTINUOUS);
-    // VIKTIGT: setResistorRange krever to parametre!
-    ina226.setResistorRange(SHUNT_RESISTOR_VALUE, MAX_CURRENT); // Shunt resistor AND max current
+    ina226.setResistorRange(SHUNT_RESISTOR_VALUE, MAX_CURRENT);
     Serial.println("INA226 power monitor initialized successfully!");
   } else {
     Serial.println("Failed to initialize INA226 power monitor. Check connections.");
   }
-  #endif
   
   // Added memory measurement at startup
   measureMemory("Startup");
   
-  #ifdef USE_MULTICORE_RTOS
-  // Initialize RTOS threads
-  // Power thread on second core (M4)
-  power_thread.start(powerMeasurementThread);
-  
-  // Crypto thread on first core (M7)
-  crypto_thread.start(cryptoBenchmarkThread);
-  
-  // Allow threads to initialize
-  delay(100);
-  #endif
-  
   Serial.println("\n==========================================");
   Serial.println("   ChaCha20 Encryption Test & Benchmark   ");
-  Serial.println("           (Dual-Core Mode)              ");
   Serial.println("==========================================");
   Serial.println("Commands:");
   Serial.println("  REPEAT [count] [text] - Run benchmark");
@@ -1692,11 +1080,9 @@ void setup() {
 
 void loop() {
   // Check if we have an ongoing benchmark
-  #ifndef USE_MULTICORE_RTOS
   if (benchmark_state == BENCHMARK_RUNNING) {
     processBenchmarkChunk();
   }
-  #endif
   
   // Check for serial input
   if (Serial.available() > 0) {
@@ -1712,10 +1098,6 @@ void loop() {
       if (input.equalsIgnoreCase("STOP") && benchmark_state == BENCHMARK_RUNNING) {
         Serial.println("Aborting benchmark...");
         benchmark_state = BENCHMARK_IDLE;
-        #ifdef USE_MULTICORE_RTOS
-        crypto_active = false;
-        benchmark_mode = false;
-        #endif
         Serial.println("Benchmark aborted!");
       }
       // Check if validation is requested
@@ -1791,14 +1173,6 @@ void loop() {
         size_t input_len = input.length();
         size_t padded_len = padData(input.c_str(), padded, input_len);
         
-        // Start power measurement for individual operation
-        #ifdef USE_MULTICORE_RTOS
-        if (!power_thread_running) {
-          single_measurement_mode = true;
-          startPowerMeasurement();
-        }
-        #endif
-        
         // Encrypt data
         unsigned long encrypt_time = encrypt(padded, encrypted, padded_len);
         
@@ -1809,7 +1183,10 @@ void loop() {
         Serial.println("         SINGLE OPERATION RESULTS        ");
         Serial.println("==========================================");
         Serial.print("Encrypted (with IV/nonce): ");
-        printHex(encrypted, min(padded_len + IV_SIZE, 32));
+        size_t display_len = padded_len + IV_SIZE;
+        if (display_len > 32) display_len = 32;
+        printHex(encrypted, display_len);
+        
         Serial.print("Encryption time: ");
         Serial.print(encrypt_time);
         Serial.println(" µs");
@@ -1845,9 +1222,7 @@ void loop() {
         Serial.print(cpu_usage, 2);
         Serial.println("%");
         
-        #ifdef USE_INA226
-        #ifndef USE_MULTICORE_RTOS
-        // Direct power reading for non-RTOS mode
+        // Direct power measurement
         float current = ina226.getCurrent_mA();
         float power = ina226.getBusPower() * 1000.0; // Convert W to mW
         Serial.print("Current usage: ");
@@ -1856,8 +1231,6 @@ void loop() {
         Serial.print("Power usage: ");
         Serial.print(power, 2);
         Serial.println(" mW");
-        #endif
-        #endif
         
         // Remove padding and null-terminate
         size_t actual_len = removePadding(decrypted, padded_len);
@@ -1866,7 +1239,7 @@ void loop() {
         Serial.print("Decrypted: ");
         Serial.println((char*)decrypted);
         
-        // Check if it's a math expression - more flexible detection
+        // Check if it's a math expression
         if (strstr((char*)decrypted, "+") || strstr((char*)decrypted, "-") || 
             strstr((char*)decrypted, "*") || strstr((char*)decrypted, "/") ||
             strstr((char*)decrypted, "(10+5)") || strstr((char*)decrypted, "(10 + 5)")) {

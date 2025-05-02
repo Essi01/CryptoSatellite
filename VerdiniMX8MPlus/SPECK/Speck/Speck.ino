@@ -1,11 +1,11 @@
-#include <Arduino.h>
-#include <SerialRPC.h>
-#ifdef ARDUINO_ARCH_MBED
-#include "mbed_stats.h"
-#include "mbed.h"
-#include "rtos/rtos.h"
-#endif
+/*
+ * SPECK Authenticated Encryption Implementation for Arduino
+ * With standardized benchmarking for comparative analysis
+ * With INA226_WE power monitoring integration
+ * With dual-core RTOS support (compatible with single-core fallback)
+ */
 
+#include <Arduino.h>
 #include <limits.h> // Include for ULONG_MAX
 
 // If ULONG_MAX is still not defined, define it manually
@@ -13,12 +13,25 @@
 #define ULONG_MAX 0xFFFFFFFFUL // Maximum value for 32-bit unsigned long
 #endif
 
-// Bare definer USE_MULTICORE_RTOS hvis vi er på dual-core
-#if defined(ARDUINO_ARCH_MBED) && defined(CORE_CM4) && defined(CORE_CM7)
-#define USE_MULTICORE_RTOS
-#define CORE_CRYPTO 1  // M7 core
-#define CORE_POWER  0  // M4 core
+// Platform detection
+#if defined(__IMXRT1062__) || defined(__MIMXRT1062__) || defined(ARDUINO_TORADEX_VERDIN_IMX8MP)
+  // Toradex-specific settings
+  #define PLATFORM_TORADEX
+  #undef USE_MULTICORE_RTOS  // Disable RTOS features on Toradex
+#elif defined(ARDUINO_ARCH_MBED)
+  #include "mbed_stats.h"
+  #include "mbed.h"
+  #include "rtos/rtos.h"
+  #if defined(CORE_CM4) && defined(CORE_CM7)
+    #define USE_MULTICORE_RTOS
+    #define CORE_CRYPTO 1  // M7 core
+    #define CORE_POWER  0  // M4 core
+  #endif
 #endif
+
+// Algorithm identification and measurement constants
+#define ALGORITHM_NAME "SPECK"
+bool detailed_memory_tracking = false;  // Variable that can be changed during runtime
 
 // Power monitoring configuration - using INA226
 #define USE_INA226
@@ -35,49 +48,18 @@ INA226_WE ina226(INA226_I2C_ADDRESS);  // Initialize with I2C address
 // Add debug timing define
 #define BENCHMARK_TIMING_DEBUG false  // Set to false to hide individual timing details
 
-// Algorithm identification and measurement constants
-#define ALGORITHM_NAME "ChaCha20"
-bool detailed_memory_tracking = false;  // Variable that can be changed during runtime
+// SPECK Constants for SPECK128/128
+#define SPECK_BLOCK_SIZE 16  // 128 bits
+#define SPECK_KEY_SIZE 16    // 128 bits
+#define SPECK_ROUNDS 32      // Number of rounds for SPECK128/128
+#define SPECK_ALPHA 8        // Rotation constant alpha
+#define SPECK_BETA 3         // Rotation constant beta
+#define IV_SIZE 16           // IV size for CBC mode
 
-// ChaCha20 Constants
-#define CHACHA20_KEY_SIZE 32    // 256-bit key
-#define CHACHA20_NONCE_SIZE 12  // 96-bit nonce (RFC 8439)
-#define CHACHA20_BLOCK_SIZE 64  // 512-bit blocks
-#define CHACHA20_ROUNDS 20      // Number of rounds (20 for ChaCha20)
-#define IV_SIZE 16              // External IV size (nonce + counter) for compatibility
-
-// ChaCha20 state constants (magic numbers from RFC 8439)
-static const uint32_t chacha20_constants[4] = {
-  0x61707865, 0x3320646e, 0x79622d32, 0x6b206574  // "expand 32-byte k" in ASCII
-};
-
-// ChaCha20 key (256-bit)
-const unsigned char chacha20_key[CHACHA20_KEY_SIZE] = {
+// SPECK key (128-bit)
+const unsigned char speck_key[SPECK_KEY_SIZE] = {
   0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-  0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-  0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F
-};
-
-// RFC 8439 Test Vector
-const uint8_t test_key[CHACHA20_KEY_SIZE] = {
-  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-  0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-  0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-  0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
-};
-
-const uint8_t test_nonce[CHACHA20_NONCE_SIZE] = {
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a,
-  0x00, 0x00, 0x00, 0x00
-};
-
-const uint32_t test_counter = 1;
-
-// First 16 bytes of expected keystream for the test vector
-const uint8_t test_keystream[16] = {
-  0x22, 0x4f, 0x51, 0xf3, 0x40, 0x1b, 0xd9, 0xe1,
-  0x2f, 0xde, 0x27, 0x6f, 0xb8, 0x63, 0x1d, 0xed
+  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
 };
 
 // Constants for non-blocking benchmark
@@ -85,13 +67,13 @@ const uint8_t test_keystream[16] = {
 #define BENCHMARK_IDLE false
 #define BENCHMARK_RUNNING true
 
-// RTOS related variables and mutexes
+// RTOS related variables and mutexes (only when multi-core mode is enabled)
 #ifdef USE_MULTICORE_RTOS
 rtos::Thread power_thread;
 rtos::Thread crypto_thread;
 rtos::Mutex power_mutex;  // To protect shared power data
 rtos::Mutex benchmark_mutex; // To protect benchmark state
-rtos::Mutex serial_mutex;  // NEW: To protect Serial output from mixing
+rtos::Mutex serial_mutex;  // To protect Serial output from mixing
 rtos::Semaphore crypto_semaphore(0); // Signal to start crypto operations
 rtos::Semaphore power_semaphore(0);  // Signal to start power measurements
 
@@ -102,7 +84,7 @@ volatile bool benchmark_mode = false;
 volatile bool single_measurement_mode = false;
 
 // Power measurement buffer
-#define MAX_POWER_SAMPLES 200
+#define MAX_POWER_SAMPLES 2000
 struct PowerSample {
   unsigned long timestamp;  // Timestamp in ms
   float current_mA;         // Current in mA
@@ -131,15 +113,15 @@ unsigned long benchmark_total_eval_time = 0;
 unsigned long benchmark_start_time = 0;
 String benchmark_text = "";
 
-// Energimåling variabler
+// Energy measurement variables
 #ifdef USE_INA226
 float benchmark_total_energy = 0.0;
 int benchmark_energy_samples = 0;
 float benchmark_avg_current = 0.0;
 float benchmark_max_current = 0.0;
-float benchmark_min_current = 9999.0;
+float benchmark_min_current =.9999.0;
 unsigned long benchmark_last_energy_sample = 0;
-const unsigned long ENERGY_SAMPLE_INTERVAL = 100; // Sample hver 100ms for non-RTOS mode
+const unsigned long ENERGY_SAMPLE_INTERVAL = 100; // Sample every 100ms
 #endif
 
 // Memory management metrics
@@ -158,10 +140,18 @@ unsigned long decrypt_goodput = 0;
 void startBenchmark(String text, long repeats);
 void processBenchmarkChunk();
 void finishBenchmark();
-bool validate_chacha20();
 unsigned long encrypt(const unsigned char* input, unsigned char* output, size_t len);
 unsigned long decrypt(const unsigned char* input, unsigned char* output, size_t len);
 unsigned long safeTimeDiff(unsigned long start, unsigned long end);
+
+#ifdef USE_MULTICORE_RTOS
+void powerMeasurementThread();
+void cryptoBenchmarkThread();
+void startPowerMeasurement();
+void startBenchmarkRTOS();
+#endif
+
+/*********************** UTILITY FUNCTIONS ***********************/
 
 // Memory management functions
 #ifdef ARDUINO_ARCH_MBED
@@ -211,9 +201,8 @@ void measureMemory(const char* label) {
   #endif
 }
 
-// Generate decision matrix data report with verification
+// Generate decision matrix data report
 void generateMatrixReport() {
-#ifdef ARDUINO_ARCH_MBED
   mbed_stats_heap_t heap_stats;
   mbed_stats_stack_t stack_stats;
   
@@ -221,16 +210,6 @@ void generateMatrixReport() {
   mbed_stats_stack_get(&stack_stats);
   
   used_ram = heap_stats.current_size + stack_stats.max_size;
-#else
-  // For non-MBED platforms, use the available free RAM metric
-  int free_ram = freeRam();
-  // This is approximate since we don't know total RAM on all platforms
-  used_ram = MAX_SIZE * 3; // Estimate based on our buffer sizes
-#endif
-  
-  // Calculate per-byte latency (more informative for decision matrix)
-  float enc_latency_per_byte = avgEnc / (float)benchmark_padded_len; // µs per byte
-  float dec_latency_per_byte = avgDec / (float)benchmark_padded_len; // µs per byte
   
   #ifdef USE_MULTICORE_RTOS
   serial_mutex.lock();
@@ -261,7 +240,6 @@ void generateMatrixReport() {
   Serial.print(avgDec, 2);
   Serial.println(" µs");
   
-  // Include per-byte latency in comments for reference
   Serial.print("Encryption Throughput: ");
   Serial.print(encrypt_throughput);
   Serial.println(" bytes/s");
@@ -278,7 +256,7 @@ void generateMatrixReport() {
   Serial.print(decrypt_goodput);
   Serial.println(" bytes/s");
   
-  // Calculate overhead percentage for stream cipher
+  // Calculate overhead percentage
   float enc_overhead_pct = 100.0 * (1.0 - ((float)benchmark_input_len / benchmark_padded_len));
   Serial.print("Protocol Overhead: ");
   Serial.print(enc_overhead_pct, 1);
@@ -303,10 +281,10 @@ void generateMatrixReport() {
     avg_current /= power_sample_count;
     avg_power /= power_sample_count;
     
-// Calculate energy in mJ (current in mA * time in s * voltage in V)
-float total_time_s = (power_samples[power_sample_count-1].timestamp - 
-                     power_samples[0].timestamp) / 1000.0;
-float total_energy = avg_current * total_time_s * 5.0; // Assuming 5V supply voltage
+    // Calculate energy in mJ (power in mW * time in s)
+    float total_time_s = (power_samples[power_sample_count-1].timestamp - 
+                          power_samples[0].timestamp) / 1000.0;
+    float total_energy = avg_power * total_time_s;
     
     Serial.print("Current (avg): ");
     Serial.print(avg_current, 2);
@@ -325,9 +303,18 @@ float total_energy = avg_current * total_time_s * 5.0; // Assuming 5V supply vol
   }
   power_mutex.unlock();
   #else
-  Serial.print("Current: ");
+  Serial.print("Current (avg): ");
   Serial.print(benchmark_avg_current, 2);
   Serial.println(" mA");
+  
+  if (benchmark_min_current < 9999.0 && benchmark_max_current > 0) {
+    Serial.print("Current (range): ");
+    Serial.print(benchmark_min_current, 2);
+    Serial.print(" - ");
+    Serial.print(benchmark_max_current, 2);
+    Serial.println(" mA");
+  }
+  
   Serial.print("Energy: ");
   Serial.print(benchmark_total_energy, 2);
   Serial.println(" mJ");
@@ -337,7 +324,7 @@ float total_energy = avg_current * total_time_s * 5.0; // Assuming 5V supply vol
   Serial.println("Power: [External measurement required]");
   #endif
   
-  Serial.println("Security Strength: 256-bit");
+  Serial.println("Security Strength: 128-bit");
   Serial.println("Error Propagation: None (stream cipher)");
   Serial.println("==========================================");
   
@@ -345,6 +332,94 @@ float total_energy = avg_current * total_time_s * 5.0; // Assuming 5V supply vol
   serial_mutex.unlock();
   #endif
 }
+
+#elif defined(PLATFORM_TORADEX)
+int freeRam() {
+  // Simple estimate for Toradex platforms
+  return 1024 * 1024; // Return a placeholder value
+}
+
+void measureMemory(const char* label) {
+  // Skip detailed metrics if not in detailed mode and not a summary label
+  if (strstr(label, "Step") != NULL && !detailed_memory_tracking) {
+    return;
+  }
+  
+  Serial.print("MEMORY [");
+  Serial.print(label);
+  Serial.println("]: Memory tracking simplified on Toradex platform");
+}
+
+void generateMatrixReport() {
+  Serial.println("\n==========================================");
+  Serial.println("        DECISION MATRIX DATA             ");
+  Serial.println("==========================================");
+  Serial.print("Algorithm: ");
+  Serial.println(ALGORITHM_NAME);
+  
+  Serial.print("Platform: Toradex Verdin iMX8M Plus");
+  Serial.println();
+  
+  Serial.print("CPU Usage: ");
+  Serial.print(cpu_usage, 2);
+  Serial.println("%");
+  
+  Serial.print("Encryption Latency: ");
+  Serial.print(avgEnc, 2);
+  Serial.println(" µs");
+  
+  Serial.print("Decryption Latency: ");
+  Serial.print(avgDec, 2);
+  Serial.println(" µs");
+  
+  Serial.print("Encryption Throughput: ");
+  Serial.print(encrypt_throughput);
+  Serial.println(" bytes/s");
+  
+  Serial.print("Decryption Throughput: ");
+  Serial.print(decrypt_throughput);
+  Serial.println(" bytes/s");
+  
+  Serial.print("Encryption Goodput: ");
+  Serial.print(encrypt_goodput);
+  Serial.println(" bytes/s");
+  
+  Serial.print("Decryption Goodput: ");
+  Serial.print(decrypt_goodput);
+  Serial.println(" bytes/s");
+  
+  // Calculate overhead percentage
+  float enc_overhead_pct = 100.0 * (1.0 - ((float)benchmark_input_len / benchmark_padded_len));
+  Serial.print("Protocol Overhead: ");
+  Serial.print(enc_overhead_pct, 1);
+  Serial.println("%");
+  
+  #ifdef USE_INA226
+  Serial.print("Current (avg): ");
+  Serial.print(benchmark_avg_current, 2);
+  Serial.println(" mA");
+  
+  if (benchmark_min_current < 9999.0 && benchmark_max_current > 0) {
+    Serial.print("Current (range): ");
+    Serial.print(benchmark_min_current, 2);
+    Serial.print(" - ");
+    Serial.print(benchmark_max_current, 2);
+    Serial.println(" mA");
+  }
+  
+  Serial.print("Energy: ");
+  Serial.print(benchmark_total_energy, 2);
+  Serial.println(" mJ");
+  #else
+  Serial.println("Current: [External measurement required]");
+  Serial.println("Power: [External measurement required]");
+  #endif
+  
+  Serial.println("Security Strength: 128-bit");
+  Serial.println("Error Propagation: None (stream cipher)");
+  Serial.println("==========================================");
+}
+
 #else
 int freeRam() {
   extern char __heap_start, *__brkval;
@@ -352,7 +427,7 @@ int freeRam() {
   return (int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
 }
 
-// Memory measurement function for non-MBED
+// Memory measurement function for non-MBED platforms
 void measureMemory(const char* label) {
   int free_ram = freeRam();
   
@@ -407,10 +482,25 @@ void generateMatrixReport() {
   Serial.print(decrypt_goodput);
   Serial.println(" bytes/s");
   
+  // Calculate overhead percentage
+  float enc_overhead_pct = 100.0 * (1.0 - ((float)benchmark_input_len / benchmark_padded_len));
+  Serial.print("Protocol Overhead: ");
+  Serial.print(enc_overhead_pct, 1);
+  Serial.println("%");
+  
   #ifdef USE_INA226
-  Serial.print("Current: ");
+  Serial.print("Current (avg): ");
   Serial.print(benchmark_avg_current, 2);
   Serial.println(" mA");
+  
+  if (benchmark_min_current < 9999.0 && benchmark_max_current > 0) {
+    Serial.print("Current (range): ");
+    Serial.print(benchmark_min_current, 2);
+    Serial.print(" - ");
+    Serial.print(benchmark_max_current, 2);
+    Serial.println(" mA");
+  }
+  
   Serial.print("Energy: ");
   Serial.print(benchmark_total_energy, 2);
   Serial.println(" mJ");
@@ -419,13 +509,13 @@ void generateMatrixReport() {
   Serial.println("Power: [External measurement required]");
   #endif
   
-  Serial.println("Security Strength: 256-bit");
+  Serial.println("Security Strength: 128-bit");
   Serial.println("Error Propagation: None (stream cipher)");
   Serial.println("==========================================");
 }
 #endif
 
-// Read current power measurements and return
+// Read current power measurements
 void readCurrentPower(float &current_mA, float &bus_voltage, float &power_mW) {
   #ifdef USE_INA226
   current_mA = ina226.getCurrent_mA();
@@ -441,17 +531,13 @@ void readCurrentPower(float &current_mA, float &bus_voltage, float &power_mW) {
 // Get INA226 power measurements
 void readPowerMeasurements() {
   #ifdef USE_INA226
-  float current_mA = 0;
-  float bus_voltage = 0;
-  float power_mW = 0;
-  
   #ifdef USE_MULTICORE_RTOS
   power_mutex.lock();
   if (power_sample_count > 0) {
     // Get the last sample
-    current_mA = power_samples[power_sample_count-1].current_mA;
-    bus_voltage = power_samples[power_sample_count-1].voltage_V;
-    power_mW = power_samples[power_sample_count-1].power_mW;
+    float current_mA = power_samples[power_sample_count-1].current_mA;
+    float bus_voltage = power_samples[power_sample_count-1].voltage_V;
+    float power_mW = power_samples[power_sample_count-1].power_mW;
     
     // Also calculate averages
     float avg_current = 0;
@@ -498,7 +584,11 @@ void readPowerMeasurements() {
   }
   power_mutex.unlock();
   #else
-  // Direct measurement in non-RTOS mode
+  float current_mA = 0;
+  float bus_voltage = 0;
+  float power_mW = 0;
+  
+  // Direct measurement
   readCurrentPower(current_mA, bus_voltage, power_mW);
   
   Serial.println("\n==========================================");
@@ -532,175 +622,102 @@ void printHex(const unsigned char* data, size_t len) {
   Serial.println();
 }
 
-// Generate a random nonce
-void generateNonce(unsigned char* nonce) {
-  for (int i = 0; i < CHACHA20_NONCE_SIZE; i++) {
-    nonce[i] = random(256);
+// Generate a random IV
+void generateIV(unsigned char* iv) {
+  for (int i = 0; i < IV_SIZE; i++) {
+    iv[i] = random(256);
   }
 }
 
-// ChaCha20 helper functions
-
-// Rotate left (circular left shift)
-inline uint32_t rotl32(uint32_t x, int n) {
-  return (x << n) | (x >> (32 - n));
+// SPECK helper functions
+// Convert a byte array to a 64-bit value (little-endian)
+uint64_t bytesToUInt64(const uint8_t* bytes) {
+  uint64_t value = 0;
+  for (int i = 0; i < 8; i++) {
+    value |= ((uint64_t)bytes[i]) << (8 * i);
+  }
+  return value;
 }
 
-// Load a 32-bit value from bytes (little-endian)
-inline uint32_t U8TO32_LITTLE(const unsigned char* p) {
-  return ((uint32_t)p[0]) | ((uint32_t)p[1] << 8) | 
-         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+// Convert a 64-bit value to a byte array (little-endian)
+void uint64ToBytes(uint64_t value, uint8_t* bytes) {
+  for (int i = 0; i < 8; i++) {
+    bytes[i] = (value >> (8 * i)) & 0xFF;
+  }
 }
 
-// Store a 32-bit value to bytes (little-endian)
-inline void U32TO8_LITTLE(unsigned char* p, uint32_t v) {
-  p[0] = v & 0xFF;
-  p[1] = (v >> 8) & 0xFF;
-  p[2] = (v >> 16) & 0xFF;
-  p[3] = (v >> 24) & 0xFF;
+// Mer kompakt og effektiv rotasjonsfunksjon
+inline uint64_t rotl(uint64_t x, unsigned int n) {
+    return (x << n) | (x >> (64 - n));
 }
 
-// The ChaCha20 quarter round function
-void chacha20_quarter_round(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
-  a += b; d ^= a; d = rotl32(d, 16);
-  c += d; b ^= c; b = rotl32(b, 12);
-  a += b; d ^= a; d = rotl32(d, 8);
-  c += d; b ^= c; b = rotl32(b, 7);
+inline uint64_t rotr(uint64_t x, unsigned int n) {
+    return (x >> n) | (x << (64 - n));
 }
 
-// The ChaCha20 block function (20 rounds = 10 column + 10 diagonal rounds)
-void chacha20_block(uint32_t* state, uint32_t* output) {
-  // Copy input state to working state
-  uint32_t x[16];
-  for (int i = 0; i < 16; i++) {
-    x[i] = state[i];
+// Mer effektiv runde-funksjon
+#define ER64(x,y,k) \
+    (x = rotr(x,8), x += y, x ^= k, y = rotl(y,3), y ^= x)
+
+#define DR64(x,y,k) \
+    (y ^= x, y = rotr(y,3), x ^= k, x -= y, x = rotl(x,8))
+
+// SPECK encrypt block
+void speck_encrypt_block(uint64_t* block, const uint64_t* round_keys, int rounds) {
+  uint64_t x = block[1];
+  uint64_t y = block[0];
+  
+  for (int i = 0; i < rounds; i++) {
+    ER64(x, y, round_keys[i]);
   }
   
-  // 20 rounds (10 column rounds + 10 diagonal rounds)
-  for (int i = 0; i < CHACHA20_ROUNDS; i += 2) {
-    // Column round
-    chacha20_quarter_round(x[0], x[4], x[8], x[12]);
-    chacha20_quarter_round(x[1], x[5], x[9], x[13]);
-    chacha20_quarter_round(x[2], x[6], x[10], x[14]);
-    chacha20_quarter_round(x[3], x[7], x[11], x[15]);
+  block[1] = x;
+  block[0] = y;
+}
+
+// SPECK decrypt block
+void speck_decrypt_block(uint64_t* block, const uint64_t* round_keys, int rounds) {
+  uint64_t x = block[1];
+  uint64_t y = block[0];
+  
+  for (int i = rounds - 1; i >= 0; i--) {
+    DR64(x, y, round_keys[i]);
+  }
+  
+  block[1] = x;
+  block[0] = y;
+}
+
+// SPECK key schedule for 128/128
+void speck_key_schedule(const uint8_t* key, uint64_t* round_keys, int rounds) {
+    uint64_t b = bytesToUInt64(key + 8);
+    uint64_t a = bytesToUInt64(key);
     
-    // Diagonal round
-    chacha20_quarter_round(x[0], x[5], x[10], x[15]);
-    chacha20_quarter_round(x[1], x[6], x[11], x[12]);
-    chacha20_quarter_round(x[2], x[7], x[8], x[13]);
-    chacha20_quarter_round(x[3], x[4], x[9], x[14]);
-  }
-  
-  // Add input state to working state
-  for (int i = 0; i < 16; i++) {
-    output[i] = x[i] + state[i];
-  }
-}
-
-// Initialize ChaCha20 state with key, nonce, and counter
-void chacha20_init(uint32_t* state, const unsigned char* key, 
-                   const unsigned char* nonce, uint32_t counter) {
-  // Constants (magic numbers from RFC 8439)
-  state[0] = chacha20_constants[0];
-  state[1] = chacha20_constants[1];
-  state[2] = chacha20_constants[2];
-  state[3] = chacha20_constants[3];
-  
-  // Key (8 words = 32 bytes)
-  state[4] = U8TO32_LITTLE(key + 0);
-  state[5] = U8TO32_LITTLE(key + 4);
-  state[6] = U8TO32_LITTLE(key + 8);
-  state[7] = U8TO32_LITTLE(key + 12);
-  state[8] = U8TO32_LITTLE(key + 16);
-  state[9] = U8TO32_LITTLE(key + 20);
-  state[10] = U8TO32_LITTLE(key + 24);
-  state[11] = U8TO32_LITTLE(key + 28);
-  
-  // Counter (1 word = 4 bytes)
-  state[12] = counter;
-  
-  // Nonce (3 words = 12 bytes)
-  state[13] = U8TO32_LITTLE(nonce + 0);
-  state[14] = U8TO32_LITTLE(nonce + 4);
-  state[15] = U8TO32_LITTLE(nonce + 8);
-}
-
-// Generate ChaCha20 keystream
-void chacha20_keystream(uint32_t* state, unsigned char* keystream, size_t len) {
-  uint32_t output[16];
-  unsigned char block[64];
-  
-  for (size_t offset = 0; offset < len; offset += 64) {
-    // Generate block of keystream
-    chacha20_block(state, output);
+    round_keys[0] = a;
     
-    // Serialize output block to bytes
-    for (int i = 0; i < 16; i++) {
-      U32TO8_LITTLE(block + (i * 4), output[i]);
+    for (int i = 0; i < rounds - 1; i++) {
+        ER64(b, a, i);
+        round_keys[i + 1] = a;
     }
-    
-    // Copy keystream to output
-    size_t block_size = min(64, len - offset);
-    memcpy(keystream + offset, block, block_size);
-    
-    // Increment counter for next block
-    state[12]++;
-  }
 }
 
-// Encrypt/decrypt data with ChaCha20
-void chacha20_encrypt_decrypt(const unsigned char* input, unsigned char* output, 
-                              size_t len, const unsigned char* key, 
-                              const unsigned char* nonce, uint32_t counter) {
-  if (detailed_memory_tracking) measureMemory("Step 1: Before ChaCha20");
-  
-  uint32_t state[16];
-  unsigned char keystream[64];
-  
-  // Initialize state
-  chacha20_init(state, key, nonce, counter);
-  
-  if (detailed_memory_tracking) measureMemory("Step 2: After State Init");
-  
-  // Process data in chunks
-  for (size_t offset = 0; offset < len; offset += 64) {
-    // Generate keystream block
-    chacha20_block(state, (uint32_t*)keystream);
-    
-    // Convert block to bytes
-    for (int i = 0; i < 16; i++) {
-      U32TO8_LITTLE(keystream + (i * 4), ((uint32_t*)keystream)[i]);
-    }
-    
-    // XOR input with keystream
-    size_t chunk_size = min(64, len - offset);
-    for (size_t i = 0; i < chunk_size; i++) {
-      output[offset + i] = input[offset + i] ^ keystream[i];
-    }
-    
-    // Increment counter for next block
-    state[12]++;
-  }
-  
-  if (detailed_memory_tracking) measureMemory("Step 3: End of ChaCha20");
-}
-
-// Pad data to ensure consistent benchmark comparison
+// Pad data to 16-byte blocks (SPECK block size)
 size_t padData(const char* input, unsigned char* output, size_t len) {
-  // Since ChaCha20 is a stream cipher, no padding is required for the algorithm itself
-  // However, we pad to 16-byte blocks for consistency with other ciphers in the benchmark
-  size_t padded_len = ((len + 15) / 16) * 16;  // Round up to nearest 16
-  
-  // Copy original data
-  memcpy(output, input, len);
-  
-  // Add padding (PKCS#7)
-  unsigned char pad_value = padded_len - len;
-  for (size_t i = len; i < padded_len; i++) {
-    output[i] = pad_value;
-  }
-  
-  return padded_len;
+    size_t padded_len = ((len + 15) / 16) * 16;  
+    
+    memcpy(output, input, len);
+    
+    unsigned char pad_value = padded_len - len;
+    if (pad_value == 0) {
+        pad_value = 16; 
+        padded_len += 16;
+    }
+    
+    for (size_t i = len; i < padded_len; i++) {
+        output[i] = pad_value;
+    }
+    
+    return padded_len;
 }
 
 // Remove padding
@@ -711,13 +728,20 @@ size_t removePadding(unsigned char* data, size_t len) {
   unsigned char padding_value = data[len - 1];
   
   // Check that padding is valid (not larger than block size)
-  if (padding_value > 16) return len;
+  if (padding_value > 16 || padding_value == 0) return len;
+  
+  // Verify that all padding bytes are the same
+  for (size_t i = len - padding_value; i < len; i++) {
+    if (data[i] != padding_value) {
+      // Invalid padding
+      return len;
+    }
+  }
   
   return len - padding_value;
 }
 
-// Encrypt data with ChaCha20 (with IV/nonce generation)
-// Returns the actual execution time in microseconds
+// Encrypt data with SPECK-CBC (with accurate time measurement)
 unsigned long encrypt(const unsigned char* input, unsigned char* output, size_t len) {
   if (detailed_memory_tracking) measureMemory("Step 1: Before Encryption");
   
@@ -735,7 +759,7 @@ unsigned long encrypt(const unsigned char* input, unsigned char* output, size_t 
   
   // Measure time more accurately by running multiple iterations for short operations
   const int MIN_ACCURATE_MICROS = 100; // Minimum time for accurate measurement
-  const int MIN_ITERATIONS = 3;       // Always do at least 3 iterations for stability
+  const int MIN_ITERATIONS = 3;        // Always do at least 3 iterations for stability
   int iterations = 0;
   unsigned long start_time = micros();
   unsigned long end_time;
@@ -752,21 +776,45 @@ unsigned long encrypt(const unsigned char* input, unsigned char* output, size_t 
     // Restore output pointer for each iteration
     output = original_output;
     
-    // Generate nonce and store at start of output
-    unsigned char nonce[CHACHA20_NONCE_SIZE];
-    generateNonce(nonce);
-    memcpy(output, nonce, CHACHA20_NONCE_SIZE);
+    // Generate IV and copy to start of output
+    unsigned char iv[IV_SIZE];
+    generateIV(iv);
+    memcpy(output, iv, IV_SIZE);
     
-    // Use initial counter of 1 (standard practice)
-    uint32_t counter = 1;
-    memcpy(output + CHACHA20_NONCE_SIZE, &counter, 4);
+    // Calculate round keys
+    uint64_t round_keys[SPECK_ROUNDS];
+    speck_key_schedule(speck_key, round_keys, SPECK_ROUNDS);
     
-    // Encrypt data
-    chacha20_encrypt_decrypt(input, output + IV_SIZE, len, chacha20_key, nonce, counter);
+    // Process each block with CBC mode
+    unsigned char prev_block[SPECK_BLOCK_SIZE];
+    memcpy(prev_block, iv, IV_SIZE);
+    
+    for (size_t i = 0; i < len; i += SPECK_BLOCK_SIZE) {
+      // XOR input with previous ciphertext (or IV for first block)
+      uint8_t xored_block[SPECK_BLOCK_SIZE];
+      for (size_t j = 0; j < SPECK_BLOCK_SIZE; j++) {
+        xored_block[j] = input[i + j] ^ prev_block[j];
+      }
+      
+      // Encrypt block
+      uint64_t block[2];
+      block[0] = bytesToUInt64(xored_block);
+      block[1] = bytesToUInt64(xored_block + 8);
+      
+      speck_encrypt_block(block, round_keys, SPECK_ROUNDS);
+      
+      // Convert result back to bytes
+      uint64ToBytes(block[0], output + IV_SIZE + i);
+      uint64ToBytes(block[1], output + IV_SIZE + i + 8);
+      
+      // Update previous block for next iteration
+      memcpy(prev_block, output + IV_SIZE + i, SPECK_BLOCK_SIZE);
+    }
     
     // Small extra work to increase timing stability for very small inputs
     if (len < 16) {
-      chacha20_encrypt_decrypt(extra_buffer, extra_buffer, sizeof(extra_buffer), chacha20_key, nonce, counter);
+      uint64_t block[2] = {0, 0};
+      speck_encrypt_block(block, round_keys, SPECK_ROUNDS);
     }
     
     end_time = micros();
@@ -789,22 +837,27 @@ unsigned long encrypt(const unsigned char* input, unsigned char* output, size_t 
   
   // For accurate benchmark reporting
   #if BENCHMARK_TIMING_DEBUG
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.lock();
+  #endif
+  
   if (iterations > 1) {
-    serial_mutex.lock();
     Serial.print("Encryption timing: Used ");
     Serial.print(iterations);
     Serial.print(" iterations for accurate measurement. Average: ");
     Serial.print(avg_time);
     Serial.println(" µs");
-    serial_mutex.unlock();
   }
+  
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.unlock();
+  #endif
   #endif
   
   return avg_time;
 }
 
-// Decrypt data with ChaCha20
-// Returns the actual execution time in microseconds
+// Decrypt data with SPECK-CBC
 unsigned long decrypt(const unsigned char* input, unsigned char* output, size_t len) {
   if (detailed_memory_tracking) measureMemory("Step 1: Before Decryption");
   
@@ -822,7 +875,7 @@ unsigned long decrypt(const unsigned char* input, unsigned char* output, size_t 
   
   // Measure time more accurately by running multiple iterations for short operations
   const int MIN_ACCURATE_MICROS = 100; // Minimum time for accurate measurement
-  const int MIN_ITERATIONS = 3;       // Always do at least 3 iterations for stability
+  const int MIN_ITERATIONS = 3;        // Always do at least 3 iterations for stability
   int iterations = 0;
   unsigned long start_time = micros();
   unsigned long end_time;
@@ -841,20 +894,44 @@ unsigned long decrypt(const unsigned char* input, unsigned char* output, size_t 
     input = original_input;
     output = original_output;
     
-    // Extract nonce from start of input
-    unsigned char nonce[CHACHA20_NONCE_SIZE];
-    memcpy(nonce, input, CHACHA20_NONCE_SIZE);
+    // Extract IV from start of input
+    unsigned char iv[IV_SIZE];
+    memcpy(iv, input, IV_SIZE);
     
-    // Extract counter
-    uint32_t counter;
-    memcpy(&counter, input + CHACHA20_NONCE_SIZE, 4);
+    // Calculate round keys
+    uint64_t round_keys[SPECK_ROUNDS];
+    speck_key_schedule(speck_key, round_keys, SPECK_ROUNDS);
     
-    // Decrypt data (same operation as encrypt for ChaCha20)
-    chacha20_encrypt_decrypt(input + IV_SIZE, output, len, chacha20_key, nonce, counter);
+    // Process each block with CBC mode
+    for (size_t i = 0; i < len; i += SPECK_BLOCK_SIZE) {
+      uint64_t block[2];
+      
+      // Load current ciphertext block
+      block[0] = bytesToUInt64(input + IV_SIZE + i);
+      block[1] = bytesToUInt64(input + IV_SIZE + i + 8);
+      
+      // Decrypt block
+      speck_decrypt_block(block, round_keys, SPECK_ROUNDS);
+      
+      // Convert back to bytes
+      uint8_t decrypted_block[SPECK_BLOCK_SIZE];
+      uint64ToBytes(block[0], decrypted_block);
+      uint64ToBytes(block[1], decrypted_block + 8);
+      
+      // XOR with previous ciphertext block (or IV for first block)
+      for (size_t j = 0; j < SPECK_BLOCK_SIZE; j++) {
+        if (i == 0) {
+          output[i + j] = decrypted_block[j] ^ iv[j];
+        } else {
+          output[i + j] = decrypted_block[j] ^ input[IV_SIZE + i - SPECK_BLOCK_SIZE + j];
+        }
+      }
+    }
     
     // Small extra work to increase timing stability for very small inputs
     if (len < 16) {
-      chacha20_encrypt_decrypt(extra_buffer, extra_buffer, sizeof(extra_buffer), chacha20_key, nonce, counter);
+      uint64_t block[2] = {0, 0};
+      speck_decrypt_block(block, round_keys, SPECK_ROUNDS);
     }
     
     end_time = micros();
@@ -877,18 +954,35 @@ unsigned long decrypt(const unsigned char* input, unsigned char* output, size_t 
   
   // For accurate benchmark reporting
   #if BENCHMARK_TIMING_DEBUG
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.lock();
+  #endif
+  
   if (iterations > 1) {
-    serial_mutex.lock();
     Serial.print("Decryption timing: Used ");
     Serial.print(iterations);
     Serial.print(" iterations for accurate measurement. Average: ");
     Serial.print(avg_time);
     Serial.println(" µs");
-    serial_mutex.unlock();
   }
+  
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.unlock();
+  #endif
   #endif
   
   return avg_time;
+}
+
+// Safe subtraction function to handle timer overflows
+unsigned long safeTimeDiff(unsigned long start, unsigned long end) {
+  // Handle timer overflow
+  if (end >= start) {
+    return end - start;
+  } else {
+    // Overflow occurred
+    return (0xFFFFFFFF - start) + end + 1;
+  }
 }
 
 // Helper function to remove spaces from a string
@@ -904,103 +998,7 @@ void removeSpaces(const char* str, char* result) {
   result[j] = '\0';
 }
 
-// Safe subtraction function to handle timer overflows
-unsigned long safeTimeDiff(unsigned long start, unsigned long end) {
-  // Handle timer overflow
-  if (end >= start) {
-    return end - start;
-  } else {
-    // Overflow occurred
-    return (0xFFFFFFFF - start) + end + 1;
-  }
-}
-
-// Validate ChaCha20 implementation against test vector
-bool validate_chacha20() {
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.lock();
-  #endif
-  
-  Serial.println("\n==========================================");
-  Serial.println("         VALIDATION TEST                 ");
-  Serial.println("==========================================");
-  Serial.println("Validating ChaCha20 implementation against test vectors...");
-  
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.unlock();
-  #endif
-  
-  // Set up test state
-  uint32_t state[16];
-  chacha20_init(state, test_key, test_nonce, test_counter);
-  
-  // Generate keystream
-  unsigned char keystream[CHACHA20_BLOCK_SIZE];
-  chacha20_keystream(state, keystream, CHACHA20_BLOCK_SIZE);
-  
-  // Verify keystream matches expected
-  bool keystream_match = true;
-  for (int i = 0; i < 16; i++) {
-    if (keystream[i] != test_keystream[i]) {
-      keystream_match = false;
-      
-      #ifdef USE_MULTICORE_RTOS
-      serial_mutex.lock();
-      #endif
-      
-      Serial.print("Keystream mismatch at byte ");
-      Serial.print(i);
-      Serial.print(": Expected ");
-      Serial.print(test_keystream[i], HEX);
-      Serial.print(", Got ");
-      Serial.println(keystream[i], HEX);
-      
-      #ifdef USE_MULTICORE_RTOS
-      serial_mutex.unlock();
-      #endif
-    }
-  }
-  
-  // Test encryption and decryption
-  const char* test_plaintext = "The quick brown fox jumps over the lazy dog";
-  size_t test_len = strlen(test_plaintext);
-  
-  unsigned char encrypted[test_len + IV_SIZE];
-  unsigned char decrypted[test_len];
-  
-  // Encrypt with known nonce and counter
-  chacha20_encrypt_decrypt((unsigned char*)test_plaintext, encrypted, test_len, 
-                          test_key, test_nonce, test_counter);
-  
-  // Decrypt
-  chacha20_encrypt_decrypt(encrypted, decrypted, test_len, 
-                          test_key, test_nonce, test_counter);
-  
-  // Check decryption result
-  bool decrypt_match = (memcmp(decrypted, test_plaintext, test_len) == 0);
-  
-  // Report results
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.lock();
-  #endif
-  
-  if (keystream_match && decrypt_match) {
-    Serial.println("Validation SUCCESSFUL! ChaCha20 implementation is correct.");
-  } else {
-    Serial.println("Validation FAILED! ChaCha20 implementation has errors.");
-    Serial.print("Keystream match: "); Serial.println(keystream_match ? "YES" : "NO");
-    Serial.print("Decrypt match: "); Serial.println(decrypt_match ? "YES" : "NO");
-  }
-  Serial.println("==========================================");
-  
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.unlock();
-  #endif
-  
-  return keystream_match && decrypt_match;
-}
-
-// Evaluate expression (for compatibility with benchmark)
+// Evaluate expression (compatible with other algorithms)
 int evaluerUttrykk(const char* expr) {
   int result = 0;
   char cleanExpr[256];
@@ -1202,7 +1200,7 @@ void startBenchmarkRTOS() {
 }
 #endif
 
-// Initialize benchmark with improved metrics collection
+// Initialize benchmark
 void startBenchmark(String text, long repeats) {
   // Measure memory before benchmark
   measureMemory("Before Benchmark");
@@ -1249,7 +1247,7 @@ void startBenchmark(String text, long repeats) {
   Serial.println("\n==========================================");
   Serial.println("         BENCHMARK STARTED                ");
   Serial.println("==========================================");
-  Serial.print("Starting ChaCha20 benchmark with ");
+  Serial.print("Starting SPECK benchmark with ");
   Serial.print(repeats);
   Serial.println(" repetitions...");
   Serial.print("Input: \"");
@@ -1275,11 +1273,11 @@ void startBenchmark(String text, long repeats) {
   #endif
 }
 
-// Process a chunk of benchmark iterations with statistical validation
+// Process a chunk of benchmark iterations
 void processBenchmarkChunk() {
   if (benchmark_state != BENCHMARK_RUNNING) return;
   
-  unsigned long start_time, end_time, encrypt_time, decrypt_time;
+  unsigned long encrypt_time, decrypt_time;
   int chunk_size = min(BENCHMARK_CHUNK_SIZE, benchmark_total_iterations - benchmark_current_iteration);
   bool report_progress = false;
   
@@ -1325,7 +1323,7 @@ void processBenchmarkChunk() {
       }
     }
     
-    // Decryption timing with verification
+    // Decryption timing
     decrypt_time = decrypt(benchmark_encrypted, benchmark_decrypted, benchmark_padded_len);
     benchmark_total_decrypt_time += decrypt_time;
     
@@ -1340,9 +1338,9 @@ void processBenchmarkChunk() {
     if (strstr((char*)benchmark_decrypted, "+") || strstr((char*)benchmark_decrypted, "-") || 
         strstr((char*)benchmark_decrypted, "*") || strstr((char*)benchmark_decrypted, "/") ||
         strstr((char*)benchmark_decrypted, "(10+5)") || strstr((char*)benchmark_decrypted, "(10 + 5)")) {
-      start_time = micros();
+      unsigned long start_time = micros();
       evaluerUttrykk((char*)benchmark_decrypted);
-      end_time = micros();
+      unsigned long end_time = micros();
       benchmark_total_eval_time += safeTimeDiff(start_time, end_time);
     }
     
@@ -1368,16 +1366,18 @@ void processBenchmarkChunk() {
       Serial.println(" repetitions completed");
       
       // Show time variance stats every 10K iterations
-      float encrypt_variance = (float)(max_encrypt_time - min_encrypt_time) / ((min_encrypt_time + max_encrypt_time) / 2.0) * 100.0;
-      float decrypt_variance = (float)(max_decrypt_time - min_decrypt_time) / ((min_decrypt_time + max_decrypt_time) / 2.0) * 100.0;
-      
-      // Only report if variance is significant (>10%)
-      if (encrypt_variance > 10.0 || decrypt_variance > 10.0) {
-        Serial.print("  Time variance - Encrypt: ");
-        Serial.print(encrypt_variance, 1);
-        Serial.print("%, Decrypt: ");
-        Serial.print(decrypt_variance, 1);
-        Serial.println("%");
+      if (min_encrypt_time < ULONG_MAX && max_encrypt_time > 0) {
+        float encrypt_variance = (float)(max_encrypt_time - min_encrypt_time) / ((min_encrypt_time + max_encrypt_time) / 2.0) * 100.0;
+        float decrypt_variance = (float)(max_decrypt_time - min_decrypt_time) / ((min_decrypt_time + max_decrypt_time) / 2.0) * 100.0;
+        
+        // Only report if variance is significant (>10%)
+        if (encrypt_variance > 10.0 || decrypt_variance > 10.0) {
+          Serial.print("  Time variance - Encrypt: ");
+          Serial.print(encrypt_variance, 1);
+          Serial.print("%, Decrypt: ");
+          Serial.print(decrypt_variance, 1);
+          Serial.println("%");
+        }
       }
     }
     
@@ -1386,7 +1386,7 @@ void processBenchmarkChunk() {
     #endif
   }
   
-  // Energimåling med sampling (non-RTOS mode only)
+  // Energy measurement with sampling (for non-RTOS mode only)
   #ifdef USE_INA226
   #ifndef USE_MULTICORE_RTOS
   unsigned long current_time = millis();
@@ -1407,7 +1407,7 @@ void processBenchmarkChunk() {
   }
 }
 
-// Complete benchmark and report results with enhanced analysis
+// Complete benchmark and report results
 void finishBenchmark() {
   // End timing for the entire benchmark
   unsigned long benchmark_end = millis();
@@ -1419,19 +1419,17 @@ void finishBenchmark() {
   benchmark_mode = false;
   #endif
   
-  // Calculate actual CPU usage more accurately
-  // Convert microseconds to milliseconds for proper comparison
+  // Calculate actual CPU usage
   cpu_usage = (benchmark_total_encrypt_time + benchmark_total_decrypt_time) / 1000.0 / total_benchmark_time * 100.0;
   
-  // Calculate energy in non-RTOS mode
+  // Calculate energy for non-RTOS mode
   #ifdef USE_INA226
   #ifndef USE_MULTICORE_RTOS
   if (benchmark_energy_samples > 0) {
     benchmark_avg_current /= benchmark_energy_samples;
-    // Beregn total energi i millijoule (mA * ms * V / 1000)
-    // Antar spenning på 5V for Arduino
+    // Calculate total energy in millijoule (mA * ms * V / 1000)
     float benchmark_seconds = total_benchmark_time / 1000.0;
-    benchmark_total_energy = benchmark_avg_current * benchmark_seconds * 5.0;
+    benchmark_total_energy = benchmark_avg_current * benchmark_seconds * 5.0; // Assume 5V
   }
   #endif
   #endif
@@ -1440,29 +1438,25 @@ void finishBenchmark() {
   unsigned long total_combined_time = benchmark_total_encrypt_time + benchmark_total_decrypt_time;
   float combined_average_time = total_combined_time / (float)(benchmark_total_iterations * 2);
   
-  // Phase 1: Calculate average times per operation
+  // Calculate per-byte latency
   avgEnc = benchmark_total_encrypt_time / (float)benchmark_total_iterations;
   avgDec = benchmark_total_decrypt_time / (float)benchmark_total_iterations;
   
-  // Phase 2: Calculate throughput (bytes per second)
+  // Calculate throughput (bytes per second)
   encrypt_throughput = (unsigned long)(benchmark_padded_len * 1e6 / avgEnc);
   decrypt_throughput = (unsigned long)(benchmark_padded_len * 1e6 / avgDec);
   
-  // Phase 3: Calculate goodput (effective bytes per second, excluding overhead)
+  // Calculate goodput (effective bytes per second, excluding overhead)
   encrypt_goodput = (unsigned long)(benchmark_input_len * 1e6 / avgEnc);
   decrypt_goodput = (unsigned long)(benchmark_input_len * 1e6 / avgDec);
   
-  // Calculate overhead and efficiency metrics
-  float overhead_bytes = (float)(benchmark_padded_len - benchmark_input_len);
-  float iv_overhead = (float)IV_SIZE; // IV + counter
-  float padding_overhead = overhead_bytes - iv_overhead;
+  // Calculate overhead percentage
   float protocol_overhead_pct = 100.0 * (1.0 - ((float)benchmark_input_len / benchmark_padded_len));
   
   #ifdef USE_MULTICORE_RTOS
   serial_mutex.lock();
   #endif
   
-  // Report benchmark results with overall statistics
   Serial.println("\n==========================================");
   Serial.println("         BENCHMARK RESULTS               ");
   Serial.println("==========================================");
@@ -1530,31 +1524,33 @@ void finishBenchmark() {
   Serial.print(protocol_overhead_pct, 1);
   Serial.println("%");
   
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.unlock();
-  #endif
-  
   #ifdef USE_INA226
   #ifdef USE_MULTICORE_RTOS
   power_mutex.lock();
+  // Calculate average power from samples
+  float avg_current = 0;
+  float avg_power = 0;
+  float max_current = 0;
+  float min_current = 9999.0;
+  
   if (power_sample_count > 0) {
-    float avg_current = 0;
-    float max_current = 0;
-    float min_current = 9999.0;
-    
     for (int i = 0; i < power_sample_count; i++) {
       avg_current += power_samples[i].current_mA;
+      avg_power += power_samples[i].power_mW;
       max_current = max(max_current, power_samples[i].current_mA);
       min_current = min(min_current, power_samples[i].current_mA);
     }
     avg_current /= power_sample_count;
+    avg_power /= power_sample_count;
     
-    serial_mutex.lock();
+    // Calculate energy in mJ (power in mW * time in s)
+    float total_time_s = (power_samples[power_sample_count-1].timestamp - 
+                        power_samples[0].timestamp) / 1000.0;
+    float total_energy = avg_power * total_time_s;
+    
     Serial.println("\n==========================================");
     Serial.println("         POWER MEASUREMENTS              ");
     Serial.println("==========================================");
-    Serial.print("Power samples collected: ");
-    Serial.println(power_sample_count);
     Serial.print("Average current: ");
     Serial.print(avg_current, 2);
     Serial.println(" mA");
@@ -1563,7 +1559,9 @@ void finishBenchmark() {
     Serial.print(" - ");
     Serial.print(max_current, 2);
     Serial.println(" mA");
-    serial_mutex.unlock();
+    Serial.print("Energy consumption: ");
+    Serial.print(total_energy, 2);
+    Serial.println(" mJ");
   }
   power_mutex.unlock();
   #else
@@ -1584,10 +1582,6 @@ void finishBenchmark() {
     Serial.println(" mJ");
   }
   #endif
-  #endif
-  
-  #ifdef USE_MULTICORE_RTOS
-  serial_mutex.lock();
   #endif
   
   if (benchmark_total_eval_time > 0) {
@@ -1637,20 +1631,135 @@ void finishBenchmark() {
   benchmark_state = BENCHMARK_IDLE;
 }
 
+// Validate SPECK implementation against test vectors
+bool validate_speck() {
+  // Test vectors from SPECK 128/128
+  const uint8_t test_key[16] = {
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+  };
+  
+  const uint8_t test_plaintext[16] = {
+    0x20, 0x6d, 0x61, 0x64, 0x65, 0x20, 0x69, 0x74,
+    0x20, 0x65, 0x71, 0x75, 0x69, 0x76, 0x61, 0x6c
+  };
+  
+  const uint8_t test_ciphertext[16] = {
+    0x18, 0x0d, 0x57, 0x5c, 0xdf, 0xfe, 0x60, 0x78,
+    0x65, 0x32, 0x78, 0x79, 0x51, 0x98, 0x5d, 0xa6
+  };
+  
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.lock();
+  #endif
+  
+  Serial.println("\n==========================================");
+  Serial.println("         VALIDATION TEST                 ");
+  Serial.println("==========================================");
+  Serial.println("Validating SPECK implementation against test vectors...");
+  
+  // Calculate round keys
+  uint64_t round_keys[SPECK_ROUNDS];
+  speck_key_schedule(test_key, round_keys, SPECK_ROUNDS);
+  
+  // Encrypt test plaintext
+  uint64_t block[2];
+  block[0] = bytesToUInt64(test_plaintext);
+  block[1] = bytesToUInt64(test_plaintext + 8);
+  
+  Serial.println("Test plaintext:");
+  printHex(test_plaintext, 16);
+  
+  speck_encrypt_block(block, round_keys, SPECK_ROUNDS);
+  
+  // Convert result to bytes
+  uint8_t result[16];
+  uint64ToBytes(block[0], result);
+  uint64ToBytes(block[1], result + 8);
+  
+  Serial.println("Encrypted result:");
+  printHex(result, 16);
+  
+  Serial.println("Expected ciphertext:");
+  printHex(test_ciphertext, 16);
+  
+  // Check if encryption matches expected ciphertext
+  bool encryption_ok = true;
+  for (int i = 0; i < 16; i++) {
+    if (result[i] != test_ciphertext[i]) {
+      encryption_ok = false;
+      Serial.print("Encryption mismatch at byte ");
+      Serial.print(i);
+      Serial.print(": Expected ");
+      Serial.print(test_ciphertext[i], HEX);
+      Serial.print(", Got ");
+      Serial.println(result[i], HEX);
+    }
+  }
+  
+  // Test decryption
+  block[0] = bytesToUInt64(test_ciphertext);
+  block[1] = bytesToUInt64(test_ciphertext + 8);
+  
+  speck_decrypt_block(block, round_keys, SPECK_ROUNDS);
+  
+  // Convert result to bytes
+  uint64ToBytes(block[0], result);
+  uint64ToBytes(block[1], result + 8);
+  
+  Serial.println("Decrypted result:");
+  printHex(result, 16);
+  
+  // Check if decryption matches original plaintext
+  bool decryption_ok = true;
+  for (int i = 0; i < 16; i++) {
+    if (result[i] != test_plaintext[i]) {
+      decryption_ok = false;
+      Serial.print("Decryption mismatch at byte ");
+      Serial.print(i);
+      Serial.print(": Expected ");
+      Serial.print(test_plaintext[i], HEX);
+      Serial.print(", Got ");
+      Serial.println(result[i], HEX);
+    }
+  }
+  
+  // Report overall validation result
+  if (encryption_ok && decryption_ok) {
+    Serial.println("Validation SUCCESSFUL! SPECK implementation is correct.");
+  } else {
+    Serial.println("Validation FAILED! SPECK implementation has errors.");
+    Serial.print("Encryption correct: "); Serial.println(encryption_ok ? "YES" : "NO");
+    Serial.print("Decryption correct: "); Serial.println(decryption_ok ? "YES" : "NO");
+  }
+  
+  Serial.println("==========================================");
+  
+  #ifdef USE_MULTICORE_RTOS
+  serial_mutex.unlock();
+  #endif
+  
+  return encryption_ok && decryption_ok;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(3000);  // Wait for serial to be ready
-  randomSeed(analogRead(0)); // Initialize random for nonce generation
+  randomSeed(analogRead(0)); // Initialize random for IV generation
   
   // Initialize INA226 power monitor
   #ifdef USE_INA226
   Wire.begin();
+  #ifdef PLATFORM_TORADEX
+  // Specific I2C pins for Toradex if needed
+  // Wire.setPins(SDA_PIN, SCL_PIN);  // Uncomment and set pins if needed
+  #endif
   if (ina226.init()) {
     // Configure INA226 with TWO parameters for each method
     ina226.setAverage(AVERAGE_1);
     ina226.setConversionTime(CONV_TIME_1100);
     ina226.setMeasureMode(CONTINUOUS);
-    // VIKTIGT: setResistorRange krever to parametre!
+    // IMPORTANT: setResistorRange requires two parameters!
     ina226.setResistorRange(SHUNT_RESISTOR_VALUE, MAX_CURRENT); // Shunt resistor AND max current
     Serial.println("INA226 power monitor initialized successfully!");
   } else {
@@ -1658,12 +1767,9 @@ void setup() {
   }
   #endif
   
-  // Added memory measurement at startup
-  measureMemory("Startup");
-  
+  // Start RTOS threads if in multi-core mode
   #ifdef USE_MULTICORE_RTOS
-  // Initialize RTOS threads
-  // Power thread on second core (M4)
+  // Power measurement thread on second core (M4)
   power_thread.start(powerMeasurementThread);
   
   // Crypto thread on first core (M7)
@@ -1673,25 +1779,31 @@ void setup() {
   delay(100);
   #endif
   
+  // Added memory measurement at startup
+  measureMemory("Startup");
+  
   Serial.println("\n==========================================");
-  Serial.println("   ChaCha20 Encryption Test & Benchmark   ");
-  Serial.println("           (Dual-Core Mode)              ");
+  #ifdef PLATFORM_TORADEX
+  Serial.println("   SPECK Encryption Test for Toradex     ");
+  #else
+  Serial.println("   SPECK Authenticated Encryption Test    ");
+  #endif
   Serial.println("==========================================");
   Serial.println("Commands:");
   Serial.println("  REPEAT [count] [text] - Run benchmark");
   Serial.println("  MATRIX - Generate decision matrix report");
   Serial.println("  MEMORY_DETAIL_ON - Enable detailed memory tracking");
   Serial.println("  MEMORY_DETAIL_OFF - Disable detailed memory tracking");
-  Serial.println("  VALIDATE - Validate ChaCha20 implementation");
+  Serial.println("  VALIDATE - Validate SPECK implementation");
   Serial.println("  POWER - Read current power measurements");
   Serial.println("  STOP - Abort running benchmark");
   
   // Run validation on startup
-  validate_chacha20();
+  validate_speck();
 }
 
 void loop() {
-  // Check if we have an ongoing benchmark
+  // Check if we have an ongoing benchmark (only in non-RTOS mode)
   #ifndef USE_MULTICORE_RTOS
   if (benchmark_state == BENCHMARK_RUNNING) {
     processBenchmarkChunk();
@@ -1703,24 +1815,39 @@ void loop() {
     unsigned long loop_start = micros(); // Start measuring loop time
     String input = Serial.readStringUntil('\n');
     input.trim();
-    
+
     if (input.length() > 0) {
+      #ifdef USE_MULTICORE_RTOS
+      serial_mutex.lock();
+      #endif
+      
       Serial.print("> ");
       Serial.println(input);
       
+      #ifdef USE_MULTICORE_RTOS
+      serial_mutex.unlock();
+      #endif
+      
       // Check if benchmark should be stopped
       if (input.equalsIgnoreCase("STOP") && benchmark_state == BENCHMARK_RUNNING) {
+        #ifdef USE_MULTICORE_RTOS
+        serial_mutex.lock();
+        #endif
+        
         Serial.println("Aborting benchmark...");
         benchmark_state = BENCHMARK_IDLE;
+        
         #ifdef USE_MULTICORE_RTOS
         crypto_active = false;
         benchmark_mode = false;
+        serial_mutex.unlock();
         #endif
+        
         Serial.println("Benchmark aborted!");
       }
       // Check if validation is requested
       else if (input.equalsIgnoreCase("VALIDATE")) {
-        validate_chacha20();
+        validate_speck();
       }
       // Check if power measurement is requested
       else if (input.equalsIgnoreCase("POWER")) {
@@ -1744,22 +1871,22 @@ void loop() {
         // Find first number in the input
         int i = 0;
         while (i < input.length() && !isDigit(input.charAt(i))) i++;
-        
+
         int start = i;
         // Read the number (all subsequent digits)
         while (i < input.length() && isDigit(input.charAt(i))) i++;
-        
+
         if (start < i) {
           // Get the repeat count
           String countStr = input.substring(start, i);
           long repeatCount = countStr.toInt();
-          
+
           // Skip any spaces after the number
           while (i < input.length() && isSpace(input.charAt(i))) i++;
-          
+
           // The rest is the text to be processed
           String textStr = input.substring(i);
-          
+
           if (repeatCount > 0 && textStr.length() > 0) {
             startBenchmark(textStr, repeatCount);
           } else {
@@ -1784,39 +1911,40 @@ void loop() {
         
         // Buffers for encryption/decryption
         unsigned char padded[MAX_SIZE] = { 0 };
-        unsigned char encrypted[MAX_SIZE + IV_SIZE] = { 0 }; // Extra space for IV/nonce
+        unsigned char encrypted[MAX_SIZE + IV_SIZE] = { 0 }; // Extra space for IV and tag
         unsigned char decrypted[MAX_SIZE] = { 0 };
-        
+
         // Add padding
         size_t input_len = input.length();
         size_t padded_len = padData(input.c_str(), padded, input_len);
-        
-        // Start power measurement for individual operation
+
+        // Start power measurement for individual operation in RTOS mode
         #ifdef USE_MULTICORE_RTOS
         if (!power_thread_running) {
           single_measurement_mode = true;
           startPowerMeasurement();
         }
         #endif
-        
+
         // Encrypt data
         unsigned long encrypt_time = encrypt(padded, encrypted, padded_len);
-        
+        size_t encrypted_len = padded_len + IV_SIZE;
+
         // Decryption
         unsigned long decrypt_time = decrypt(encrypted, decrypted, padded_len);
-        
+
         Serial.println("\n==========================================");
         Serial.println("         SINGLE OPERATION RESULTS        ");
         Serial.println("==========================================");
-        Serial.print("Encrypted (with IV/nonce): ");
-        printHex(encrypted, min(padded_len + IV_SIZE, 32));
+        Serial.print("Encrypted (with IV): ");
+        printHex(encrypted, min(encrypted_len, 32));
         Serial.print("Encryption time: ");
         Serial.print(encrypt_time);
         Serial.println(" µs");
         Serial.print("Decryption time: ");
         Serial.print(decrypt_time);
         Serial.println(" µs");
-        
+
         // Calculate throughput and goodput
         float encrypt_throughput = padded_len * 1e6 / encrypt_time;
         float decrypt_throughput = padded_len * 1e6 / decrypt_time;
@@ -1836,7 +1964,7 @@ void loop() {
         Serial.print("Decryption goodput: ");
         Serial.print(decrypt_goodput);
         Serial.println(" bytes/s");
-        
+
         // Calculate CPU usage for this loop iteration
         unsigned long loop_end = micros();
         unsigned long iteration_time = safeTimeDiff(loop_start, loop_end);
@@ -1844,10 +1972,10 @@ void loop() {
         Serial.print("CPU usage for encryption/decryption: ");
         Serial.print(cpu_usage, 2);
         Serial.println("%");
-        
+
         #ifdef USE_INA226
         #ifndef USE_MULTICORE_RTOS
-        // Direct power reading for non-RTOS mode
+        // Direct power measurement for non-RTOS mode
         float current = ina226.getCurrent_mA();
         float power = ina226.getBusPower() * 1000.0; // Convert W to mW
         Serial.print("Current usage: ");
@@ -1858,7 +1986,7 @@ void loop() {
         Serial.println(" mW");
         #endif
         #endif
-        
+
         // Remove padding and null-terminate
         size_t actual_len = removePadding(decrypted, padded_len);
         decrypted[actual_len] = '\0';
@@ -1866,7 +1994,7 @@ void loop() {
         Serial.print("Decrypted: ");
         Serial.println((char*)decrypted);
         
-        // Check if it's a math expression - more flexible detection
+        // Check if it's a math expression
         if (strstr((char*)decrypted, "+") || strstr((char*)decrypted, "-") || 
             strstr((char*)decrypted, "*") || strstr((char*)decrypted, "/") ||
             strstr((char*)decrypted, "(10+5)") || strstr((char*)decrypted, "(10 + 5)")) {
