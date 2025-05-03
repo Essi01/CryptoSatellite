@@ -23,6 +23,9 @@
 #include <sstream>
 #include <sys/stat.h> // For stat
 
+#include <stack>
+#include <cmath>
+#include <stdexcept>
 
 #include "cipher_constants.h"
 #include "speck.h"
@@ -44,6 +47,120 @@ void verify_decryption(const std::vector<uint8_t> &pt, const std::vector<uint8_t
     {
         std::cout << "❌ Mismatch: Decryption failed\n";
     }
+}
+
+double eval_expr(const std::string &expr)
+{
+    std::stack<double> values;
+    std::stack<char> ops;
+
+    auto precedence = [](char op)
+    {
+        if (op == '+' || op == '-')
+            return 1;
+        if (op == '*' || op == '/')
+            return 2;
+        return 0;
+    };
+
+    auto apply_op = [](double a, double b, char op) -> double
+    {
+        switch (op)
+        {
+        case '+':
+            return a + b;
+        case '-':
+            return a - b;
+        case '*':
+            return a * b;
+        case '/':
+            if (b == 0.0)
+                throw std::runtime_error("Divide by zero");
+            return a / b;
+        default:
+            throw std::runtime_error("Unknown operator");
+        }
+    };
+
+    size_t i = 0;
+    while (i < expr.size())
+    {
+        char ch = expr[i];
+
+        if (std::isspace(ch))
+        {
+            ++i;
+            continue;
+        }
+
+        if (std::isdigit(ch) || ch == '.')
+        {
+            std::string num;
+            while (i < expr.size() && (std::isdigit(expr[i]) || expr[i] == '.'))
+            {
+                num += expr[i++];
+            }
+            values.push(std::stod(num));
+            continue;
+        }
+
+        if (ch == '(')
+        {
+            ops.push(ch);
+        }
+        else if (ch == ')')
+        {
+            while (!ops.empty() && ops.top() != '(')
+            {
+                double b = values.top();
+                values.pop();
+                double a = values.top();
+                values.pop();
+                char op = ops.top();
+                ops.pop();
+                values.push(apply_op(a, b, op));
+            }
+            if (ops.empty() || ops.top() != '(')
+                throw std::runtime_error("Mismatched parentheses");
+            ops.pop(); // Remove '('
+        }
+        else if (ch == '+' || ch == '-' || ch == '*' || ch == '/')
+        {
+            while (!ops.empty() && precedence(ops.top()) >= precedence(ch))
+            {
+                double b = values.top();
+                values.pop();
+                double a = values.top();
+                values.pop();
+                char op = ops.top();
+                ops.pop();
+                values.push(apply_op(a, b, op));
+            }
+            ops.push(ch);
+        }
+        else
+        {
+            throw std::runtime_error(std::string("Invalid character: ") + ch);
+        }
+
+        ++i;
+    }
+
+    while (!ops.empty())
+    {
+        double b = values.top();
+        values.pop();
+        double a = values.top();
+        values.pop();
+        char op = ops.top();
+        ops.pop();
+        values.push(apply_op(a, b, op));
+    }
+
+    if (values.size() != 1)
+        throw std::runtime_error("Malformed expression");
+
+    return values.top();
 }
 
 // INA219 settings (via hwmon)
@@ -351,6 +468,47 @@ int main(int argc, char *argv[])
     long ram = ru_end.ru_maxrss * 1024;
 
     verify_decryption(pt, dt, data_len);
+
+    // sanitize decrypted string
+    std::string decrypted;
+    for (size_t i = 0; i < data_len; ++i)
+        if (dt[i] >= 32 && dt[i] <= 126)
+            decrypted += static_cast<char>(dt[i]);
+
+    std::cout << "[DEBUG] Decrypted length: " << decrypted.size() << "\n";
+    std::cout << "[DEBUG] Decrypted content: " << decrypted << "\n";
+
+    // If expression ends with "=?", evaluate
+    if (decrypted.size() > 2 && decrypted.substr(decrypted.size() - 2) == "=?")
+    {
+        std::string expr = decrypted.substr(0, decrypted.size() - 2);
+
+        if (expr.empty())
+            throw std::runtime_error("Empty expression");
+
+        int balance = 0;
+        for (char c : expr)
+        {
+            if (c == '(')
+                balance++;
+            else if (c == ')')
+                balance--;
+            if (balance < 0)
+                throw std::runtime_error("Unmatched closing parenthesis");
+        }
+        if (balance != 0)
+            throw std::runtime_error("Unbalanced parentheses");
+
+        try
+        {
+            double result = eval_expr(expr);
+            std::cout << "🧮 Expression Result: " << result << "\n";
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Expression evaluation error: " << e.what() << "\n";
+        }
+    }
 
     std::cout << "---------------------\n"
               << "Iterations=" << iterations << "\n"
