@@ -23,8 +23,28 @@
 #include <sstream>
 #include <sys/stat.h> // For stat
 
+
 #include "cipher_constants.h"
 #include "speck.h"
+
+void verify_decryption(const std::vector<uint8_t> &pt, const std::vector<uint8_t> &dt, size_t data_len)
+{
+    std::string original(pt.begin(), pt.begin() + data_len);
+    std::string decrypted(dt.begin(), dt.begin() + data_len);
+
+    std::cout << "\n--- Verification ---\n";
+    std::cout << "Original : " << original << "\n";
+    std::cout << "Decrypted: " << decrypted << "\n";
+
+    if (original == decrypted)
+    {
+        std::cout << "✅ Match: Decryption successful\n";
+    }
+    else
+    {
+        std::cout << "❌ Mismatch: Decryption failed\n";
+    }
+}
 
 // INA219 settings (via hwmon)
 static const char *HWMON_PATH = "/sys/class/hwmon/hwmon4"; // INA219 on Verdin iMX8M Plus
@@ -279,6 +299,7 @@ int main(int argc, char *argv[])
     cpu_sampling.store(false);
     pwr_thread.join();
     cpu_thread.join();
+    
 
     // Get RAM usage
     struct rusage ru_end;
@@ -329,20 +350,24 @@ int main(int argc, char *argv[])
 
     long ram = ru_end.ru_maxrss * 1024;
 
-    std::cout
-        << "\nEnc=" << enc_us << " us\n"
-        << "Dec=" << dec_us << " us\n"
-        << "LatencyEnc=" << latency_e << " us\n"
-        << "LatencyDec=" << latency_d << " us\n"
-        << "ThroughputEnc=" << tp_e << " B/s\n"
-        << "ThroughputDec=" << tp_d << " B/s\n"
-        << "PeakRAM=" << ram << " bytes\n"
-        << "ProgramSize=" << program_size << " bytes (run 'aarch64-linux-gnu-size speck_bench_cbc_arm64' for accurate ROM usage)\n\n"
-        << "PowerSamples=" << sample_count << "\n"
-        << "AvgPower=" << avg_p << " mW\n"
-        << "AvgCurrent=" << avg_curr_mA << " mA\n"
-        << "AvgCPUUsage=" << avg_cpu << " %\n"
-        << "Energy=" << e_mJ << " mJ\n";
+    verify_decryption(pt, dt, data_len);
+
+    std::cout << "---------------------\n"
+              << "Iterations=" << iterations << "\n"
+              << "Enc=" << enc_us << " us\n"
+              << "Dec=" << dec_us << " us\n"
+              << "LatencyEnc=" << latency_e << " us\n"
+              << "LatencyDec=" << latency_d << " us\n"
+              << "ThroughputEnc=" << tp_e << " B/s\n"
+              << "ThroughputDec=" << tp_d << " B/s\n"
+              << "PeakRAM=" << ram << " bytes\n"
+              << "ProgramSize=" << program_size << " bytes (run 'aarch64-linux-gnu-size speck_bench_cbc_arm64' for accurate ROM usage)\n\n"
+              << "PowerSamples=" << sample_count << "\n"
+              << "AvgPower=" << avg_p << " mW\n"
+              << "AvgCurrent=" << avg_curr_mA << " mA\n"
+              << "AvgCPUUsage=" << avg_cpu << " %\n"
+              << "Energy=" << e_mJ << " mJ\n"
+              << "---------------------\n";
 
     return 0;
 }
