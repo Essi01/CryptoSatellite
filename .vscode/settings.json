@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "chrono": "cpp",
+        "cstring": "cpp",
+        "cerrno": "cpp"
+    }
+}

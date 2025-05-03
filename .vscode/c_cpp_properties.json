@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "name": "Linux-Arm64",
+            "compilerPath": "/usr/bin/aarch64-linux-gnu-g++",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-arm64",
+            "includePath": [
+                "${workspaceFolder}/VerdiniMX8MPlus/SPECK/**",
+                "/usr/include",
+                "/usr/include/linux"
+            ],
+            "browse": {
+                "path": [
+                    "${workspaceFolder}/VerdiniMX8MPlus/SPECK"
+                ]
+            }
+        }
+    ],
+    "version": 4
+}
