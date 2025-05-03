@@ -1,32 +1,107 @@
-// Speck-64/128 CBC benchmark using Simon_Speck_Ciphers repo implementation
-// Compile (ARM64):
-//   aarch64-linux-gnu-g++ speck_benchmark.cpp speck.c -I. -o speck_bench_cbc_arm64
-// Post-compilation, measure ROM/Flash usage:
-//   aarch64-linux-gnu-size speck_bench_cbc_arm64
+#define _POSIX_C_SOURCE 200809L
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE // Enable GNU extensions for CPU_SET
+#endif
 
 #include <chrono>
 #include <iostream>
 #include <vector>
 #include <cstdint>
 #include <string>
-#include <cstring>
+#include <string.h> // For strerror
+#include <thread>
+#include <atomic>
+#include <mutex>
 #include <sys/resource.h>
-
-// Work around mode_t conflict from sys/types.h
-#ifdef mode_t
-#undef mode_t
-#endif
+#include <fcntl.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sched.h> // For CPU_ZERO, CPU_SET
+#include <errno.h> // For errno
+#include <fstream>
 
 #include "cipher_constants.h"
 #include "speck.h"
 
-// Compile-time estimation of ROM/Flash usage for the algorithm
-// These are rough estimates based on typical code sizes for Speck-64/128 and benchmark code
-// Actual values should be measured using `aarch64-linux-gnu-size` on the compiled binary
-static const size_t ESTIMATED_CODE_SIZE = 5000;       // Estimated size of speck.c code (bytes)
-static const size_t ESTIMATED_CONST_SIZE = 100;       // Estimated size of constants (speck_rounds, block_sizes, key_sizes)
-static const size_t ESTIMATED_BENCH_CODE_SIZE = 2000; // Estimated size of benchmark code
-static const size_t ESTIMATED_ROM_USAGE = ESTIMATED_CODE_SIZE + ESTIMATED_CONST_SIZE + ESTIMATED_BENCH_CODE_SIZE;
+// INA219 settings (via hwmon)
+static const char *HWMON_PATH = "/sys/class/hwmon/hwmon4"; // INA219 on Verdin iMX8M Plus
+
+class INA219
+{
+    std::string power_path;
+
+public:
+    INA219(const char *hwmon_path)
+    {
+        power_path = std::string(hwmon_path) + "/power1_input";
+        // Verify file exists
+        std::ifstream f(power_path);
+        if (!f.is_open())
+        {
+            std::cerr << "Cannot open " << power_path << ": " << strerror(errno) << "\n";
+        }
+    }
+
+    bool begin()
+    {
+        // No initialization needed for hwmon; assume driver is configured
+        std::ifstream f(power_path);
+        return f.is_open();
+    }
+
+    float readPower_mW()
+    {
+        std::ifstream f(power_path);
+        if (!f.is_open())
+        {
+            std::cerr << "Failed to read " << power_path << ": " << strerror(errno) << "\n";
+            return 0;
+        }
+        std::string line;
+        std::getline(f, line);
+        try
+        {
+            // power1_input is in microwatts; convert to milliwatts
+            return std::stof(line) / 1000.0f;
+        }
+        catch (...)
+        {
+            std::cerr << "Invalid power reading from " << power_path << "\n";
+            return 0;
+        }
+    }
+};
+
+INA219 ina(HWMON_PATH);
+
+// power-sampling control
+std::atomic<bool> sampling{false};
+std::vector<float> power_samples;
+std::mutex samples_mtx;
+
+// pin thread to specific core
+void pin_to_core(int core_id)
+{
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    CPU_SET(core_id, &cpus);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+}
+
+// power-sampling thread
+void power_thread_fn()
+{
+    pin_to_core(1);
+    while (sampling.load())
+    {
+        float p = ina.readPower_mW();
+        {
+            std::lock_guard<std::mutex> lk(samples_mtx);
+            power_samples.push_back(p);
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(1200));
+    }
+}
 
 int main(int argc, char *argv[])
 {
@@ -38,112 +113,104 @@ int main(int argc, char *argv[])
     size_t iterations = std::stoul(argv[1]);
     std::string plain = argv[2];
 
-    const size_t BLOCK_SIZE = 8; // bytes per block
-    const size_t KEY_SIZE = 16;  // bytes (128-bit key)
+    // init INA219
+    if (!ina.begin())
+    {
+        std::cerr << "INA219 init failed\n";
+        return 1;
+    }
 
-    // Pad plaintext
-    size_t data_len = plain.size();
-    size_t pad_len = ((data_len + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-    std::vector<uint8_t> pt(pad_len, 0);
+    // prepare data
+    const size_t BLOCK_SIZE = 8, KEY_SIZE = 16;
+    size_t data_len = plain.size(),
+           pad_len = ((data_len + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    std::vector<uint8_t> pt(pad_len, 0), ct(pad_len), dt(pad_len);
     memcpy(pt.data(), plain.data(), data_len);
-    size_t blocks = pad_len / BLOCK_SIZE;
+    uint8_t key[KEY_SIZE], iv[BLOCK_SIZE] = {0};
+    for (size_t i = 0; i < KEY_SIZE; i++)
+        key[i] = uint8_t(i);
 
-    std::vector<uint8_t> ct(pad_len), dt(pad_len);
+    // start power thread
+    sampling.store(true);
+    std::thread pwr_thread(power_thread_fn);
 
-    // Example key and IV
-    uint8_t key[KEY_SIZE];
-    for (size_t i = 0; i < KEY_SIZE; ++i)
-        key[i] = static_cast<uint8_t>(i);
-    uint8_t iv[BLOCK_SIZE] = {0};
-
-    // Estimate algorithm's RAM footprint
-    size_t cipher_struct_size = sizeof(SimSpk_Cipher); // Size of cipher object
-    size_t key_size = KEY_SIZE;                        // Key buffer
-    size_t iv_size = BLOCK_SIZE;                       // IV buffer
-    size_t pt_size = pad_len;                          // Plaintext buffer
-    size_t ct_size = pad_len;                          // Ciphertext buffer
-    size_t dt_size = pad_len;                          // Decrypted text buffer
-    size_t total_algo_memory = cipher_struct_size + key_size + iv_size + pt_size + ct_size + dt_size;
-
-    // Measure CPU time and memory for encryption
+    // capture baseline
     struct rusage ru_start, ru_enc, ru_end;
     getrusage(RUSAGE_SELF, &ru_start);
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    // Encryption benchmark
+    // encryption
     for (size_t it = 0; it < iterations; ++it)
     {
-        SimSpk_Cipher cipher = {};
-        std::cout << "Before Speck_Init (encrypt): cipher.block_size = " << (int)cipher.block_size << "\n";
-        int init_result = Speck_Init(&cipher, cfg_128_64, CBC, key, iv, nullptr);
-        std::cout << "Speck_Init (encrypt) returned: " << init_result << "\n";
-        std::cout << "After Speck_Init (encrypt): cipher.block_size = " << (int)cipher.block_size << "\n";
-        if (init_result != 0)
+        SimSpk_Cipher c{};
+        int r = Speck_Init(&c, cfg_128_64, CBC, key, iv, nullptr);
+        if (r)
         {
-            std::cerr << "Speck_Init failed with return value: " << init_result << "\n";
+            sampling.store(false);
+            pwr_thread.join();
             return 1;
         }
-        for (size_t b = 0; b < blocks; ++b)
-        {
-            Speck_Encrypt(cipher, pt.data() + b * BLOCK_SIZE, ct.data() + b * BLOCK_SIZE);
-        }
+        for (size_t b = 0; b < pad_len / BLOCK_SIZE; ++b)
+            Speck_Encrypt(c, pt.data() + b * BLOCK_SIZE, ct.data() + b * BLOCK_SIZE);
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     getrusage(RUSAGE_SELF, &ru_enc);
 
-    // Decryption benchmark
-    auto t2 = std::chrono::high_resolution_clock::now();
+    // decryption
     for (size_t it = 0; it < iterations; ++it)
     {
-        SimSpk_Cipher cipher = {};
-        std::cout << "Before Speck_Init (decrypt): cipher.block_size = " << (int)cipher.block_size << "\n";
-        int init_result = Speck_Init(&cipher, cfg_128_64, CBC, key, iv, nullptr);
-        std::cout << "Speck_Init (decrypt) returned: " << init_result << "\n";
-        std::cout << "After Speck_Init (decrypt): cipher.block_size = " << (int)cipher.block_size << "\n";
-        if (init_result != 0)
+        SimSpk_Cipher c{};
+        int r = Speck_Init(&c, cfg_128_64, CBC, key, iv, nullptr);
+        if (r)
         {
-            std::cerr << "Speck_Init failed with return value: " << init_result << "\n";
+            sampling.store(false);
+            pwr_thread.join();
             return 1;
         }
-        for (size_t b = 0; b < blocks; ++b)
-        {
-            Speck_Decrypt(cipher, ct.data() + b * BLOCK_SIZE, dt.data() + b * BLOCK_SIZE);
-        }
+        for (size_t b = 0; b < pad_len / BLOCK_SIZE; ++b)
+            Speck_Decrypt(c, ct.data() + b * BLOCK_SIZE, dt.data() + b * BLOCK_SIZE);
     }
     auto t3 = std::chrono::high_resolution_clock::now();
     getrusage(RUSAGE_SELF, &ru_end);
 
-    // Calculate metrics
+    // stop sampling
+    sampling.store(false);
+    pwr_thread.join();
+
+    // compute power stats
+    double sum = 0;
+    {
+        std::lock_guard<std::mutex> lk(samples_mtx);
+        for (float p : power_samples)
+            sum += p;
+    }
+    double avg_p = power_samples.empty() ? 0 : sum / power_samples.size();
+    double dur_s = std::chrono::duration<double>(t3 - t0).count();
+    double e_mJ = avg_p * dur_s;
+
+    // timing
     double enc_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-    double dec_us = std::chrono::duration<double, std::micro>(t3 - t2).count();
-    double avg_enc = enc_us / iterations;
-    double avg_dec = dec_us / iterations;
-    double tp_enc = (iterations * pad_len) / (enc_us / 1e6);
-    double tp_dec = (iterations * pad_len) / (dec_us / 1e6);
+    double dec_us = std::chrono::duration<double, std::micro>(t3 - t1).count();
+    double avg_e = enc_us / iterations;
+    double avg_d = dec_us / iterations;
+    double tp_e = (iterations * pad_len) / (enc_us / 1e6);
+    double tp_d = (iterations * pad_len) / (dec_us / 1e6);
 
-    // CPU usage for encryption
-    double wall_enc_s = std::chrono::duration<double>(t1 - t0).count();
-    double cpu_start = ru_start.ru_utime.tv_sec + ru_start.ru_utime.tv_usec / 1e6 + ru_start.ru_stime.tv_sec + ru_start.ru_stime.tv_usec / 1e6;
-    double cpu_enc = ru_enc.ru_utime.tv_sec + ru_enc.ru_utime.tv_usec / 1e6 + ru_enc.ru_stime.tv_sec + ru_enc.ru_stime.tv_usec / 1e6;
-    double cpu_usage_enc = ((cpu_enc - cpu_start) / wall_enc_s) * 100.0;
+    long ram_e = ru_enc.ru_maxrss * 1024;
+    long ram_d = ru_end.ru_maxrss * 1024;
 
-    // Memory usage
-    long ram_enc_peak = ru_enc.ru_maxrss * 1024; // Convert KB to bytes
-    long ram_dec_peak = ru_end.ru_maxrss * 1024; // Convert KB to bytes
-
-    // Output metrics
-    std::cout << "Enc=" << enc_us << " us\n"
-              << "Dec=" << dec_us << " us\n"
-              << "AvgEnc=" << avg_enc << " us\n"
-              << "AvgDec=" << avg_dec << " us\n"
-              << "ThroughputEnc=" << tp_enc << " B/s\n"
-              << "ThroughputDec=" << tp_dec << " B/s\n"
-              << "CPUUsageEnc=" << cpu_usage_enc << "%\n"
-              << "PeakRAMEnc=" << ram_enc_peak << " bytes\n"
-              << "PeakRAMDec=" << ram_dec_peak << " bytes\n"
-              << "EstimatedAlgoRAM=" << total_algo_memory << " bytes\n"
-              << "EstimatedROMUsage=" << ESTIMATED_ROM_USAGE << " bytes\n"
-              << "Note: For actual ROM/Flash usage, run: aarch64-linux-gnu-size " << argv[0] << "\n";
+    std::cout
+        << "\nEnc=" << enc_us << " us\n"
+        << "Dec=" << dec_us << " us\n"
+        << "AvgEnc=" << avg_e << " us\n"
+        << "AvgDec=" << avg_d << " us\n"
+        << "ThroughputEnc=" << tp_e << " B/s\n"
+        << "ThroughputDec=" << tp_d << " B/s\n"
+        << "PeakRAMEnc=" << ram_e << " bytes\n"
+        << "PeakRAMDec=" << ram_d << " bytes\n\n"
+        << "PowerSamples=" << power_samples.size() << "\n"
+        << "AvgPower=" << avg_p << " mW\n"
+        << "Energy=" << e_mJ << " mJ\n";
 
     return 0;
 }
