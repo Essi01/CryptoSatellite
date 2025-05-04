@@ -1190,27 +1190,60 @@ printf("Energy efficiency: %.6f µJ/byte\n", per_byte_energy * 1000.0);
     // Add memory measurement at end
     measure_memory("After Benchmark");
 }
-// Legg denne funksjonen til rett før main-funksjonen
+// Forbedret bildebehandlingsfunksjon med verifisering og filtype-deteksjon
 void processImageFile(const char* filename) {
     FILE *fp = fopen(filename, "rb");
     if (!fp) {
+        pthread_mutex_lock(&print_mutex);
         printf("Failed to open file: %s\n", filename);
+        pthread_mutex_unlock(&print_mutex);
         return;
     }
+    
+    // Hent filtype fra filnavnet (for å lage korrekt dekryptert filnavn)
+    char file_extension[16] = ".jpg"; // Standard hvis ingen filtype finnes
+    const char *dot = strrchr(filename, '.');
+    if (dot && strlen(dot) < 15) {
+        // Kopier filtypen (inkludert punktumet)
+        strcpy(file_extension, dot);
+    }
+    
+    // Opprett filnavn for dekryptert fil
+    char decrypted_filename[128] = "decrypted";
+    strcat(decrypted_filename, file_extension);
     
     // Les filstørrelse
     fseek(fp, 0, SEEK_END);
     size_t filesize = ftell(fp);
     fseek(fp, 0, SEEK_SET);
     
+    pthread_mutex_lock(&print_mutex);
+    printf("\nStarting image encryption for %s (%zu bytes)...\n", filename, filesize);
+    pthread_mutex_unlock(&print_mutex);
+    
     // Alloker buffer
     unsigned char *buffer = malloc(filesize);
     unsigned char *encrypted = malloc(filesize + IV_SIZE + TAG_SIZE);
     unsigned char *decrypted = malloc(filesize);
     
+    if (!buffer || !encrypted || !decrypted) {
+        pthread_mutex_lock(&print_mutex);
+        printf("Error: Failed to allocate memory for file processing\n");
+        pthread_mutex_unlock(&print_mutex);
+        
+        fclose(fp);
+        if (buffer) free(buffer);
+        if (encrypted) free(encrypted);
+        if (decrypted) free(decrypted);
+        return;
+    }
+    
     // Les filen
     if (fread(buffer, 1, filesize, fp) != filesize) {
+        pthread_mutex_lock(&print_mutex);
         printf("Failed to read entire file\n");
+        pthread_mutex_unlock(&print_mutex);
+        
         fclose(fp);
         free(buffer);
         free(encrypted);
@@ -1219,8 +1252,30 @@ void processImageFile(const char* filename) {
     }
     fclose(fp);
     
+    // Start kontinuerlig strømmåling før kryptering hvis det ikke allerede kjører
+    bool was_benchmark_running = (benchmark_state == BENCHMARK_RUNNING);
+    
+    if (!was_benchmark_running) {
+        // Reset strømmålinger for å få rene målinger for bildeoperasjonen
+        pthread_mutex_lock(&power_mutex);
+        power_sample_count = 0;
+        benchmark_total_energy = 0.0;
+        benchmark_avg_current = 0.0;
+        benchmark_max_current = 0.0;
+        benchmark_min_current = 9999.0;
+        pthread_mutex_unlock(&power_mutex);
+        
+        pthread_mutex_lock(&cpu_mutex);
+        crypto_core_usage = 0.0;
+        max_crypto_usage = 0.0;
+        pthread_mutex_unlock(&cpu_mutex);
+    }
+    
     // Måling av minne før kryptering
     measure_memory("Before Image Encryption");
+    
+    // Start timing
+    unsigned long start_time = get_time_ms();
     
     // Krypter data
     unsigned long encrypt_time = encrypt(buffer, encrypted, filesize);
@@ -1228,31 +1283,121 @@ void processImageFile(const char* filename) {
     // Dekrypter data
     unsigned long decrypt_time = decrypt(encrypted, decrypted, filesize + IV_SIZE + TAG_SIZE);
     
+    // Slutt timing
+    unsigned long total_time = safeTimeDiff(start_time, get_time_ms());
+    
+    // Verifiser at dekryptering var vellykket
+    bool verification_success = true;
+    for (size_t i = 0; i < filesize; i++) {
+        if (buffer[i] != decrypted[i]) {
+            verification_success = false;
+            break;
+        }
+    }
+    
     // Lagre kryptert fil
     FILE *enc_fp = fopen("encrypted.bin", "wb");
-    fwrite(encrypted, 1, filesize + IV_SIZE + TAG_SIZE, enc_fp);
-    fclose(enc_fp);
+    if (enc_fp) {
+        fwrite(encrypted, 1, filesize + IV_SIZE + TAG_SIZE, enc_fp);
+        fclose(enc_fp);
+    } else {
+        pthread_mutex_lock(&print_mutex);
+        printf("Failed to create encrypted file\n");
+        pthread_mutex_unlock(&print_mutex);
+    }
     
     // Lagre dekryptert fil
-    FILE *dec_fp = fopen("decrypted.jpg", "wb");
-    fwrite(decrypted, 1, filesize, dec_fp);
-    fclose(dec_fp);
+    FILE *dec_fp = fopen(decrypted_filename, "wb");
+    if (dec_fp) {
+        fwrite(decrypted, 1, filesize, dec_fp);
+        fclose(dec_fp);
+    } else {
+        pthread_mutex_lock(&print_mutex);
+        printf("Failed to create decrypted file\n");
+        pthread_mutex_unlock(&print_mutex);
+    }
     
     // Måling av minne etter kryptering
     measure_memory("After Image Processing");
     
+    // Hent strømmålinger
+    pthread_mutex_lock(&power_mutex);
+    float avg_current = 0.0;
+    float avg_voltage = 0.0;
+    float avg_power = 0.0;
+    
+    if (power_sample_count > 0) {
+        for (int i = 0; i < power_sample_count; i++) {
+            avg_current += power_samples[i].current_mA;
+            avg_voltage += power_samples[i].voltage_V;
+            avg_power += power_samples[i].power_mW;
+        }
+        avg_current /= power_sample_count;
+        avg_voltage /= power_sample_count;
+        avg_power /= power_sample_count;
+    }
+    pthread_mutex_unlock(&power_mutex);
+    
+    // Hent CPU-bruk
+    pthread_mutex_lock(&cpu_mutex);
+    float cpu_percent = 0.0;
+    if (cpu_sample_count > 0) {
+        // Bruk de siste 20 sample for best nøyaktighet
+        int start_idx = (cpu_sample_count > 20) ? (cpu_sample_count - 20) : 0;
+        int valid_samples = 0;
+        
+        for (int i = start_idx; i < cpu_sample_count; i++) {
+            cpu_percent += cpu_samples[i].cpu_usage_percent;
+            valid_samples++;
+        }
+        
+        if (valid_samples > 0) {
+            cpu_percent /= valid_samples;
+        }
+    }
+    float core_usage = crypto_core_usage; // Bruk av kryptokjernen
+    pthread_mutex_unlock(&cpu_mutex);
+    
+    // Beregn energiforbruk
+    float duration_s = total_time / 1000.0;
+    float energy_mj = avg_power * duration_s;
+    float energy_j = energy_mj / 1000.0;
+    float energy_uj_per_byte = (energy_mj * 1000.0) / filesize;
+    
+    // Beregn gjennomstrømning
+    float enc_mb_per_s = (filesize * 1.0 / encrypt_time) * 1000000 / (1024*1024);
+    float dec_mb_per_s = (filesize * 1.0 / decrypt_time) * 1000000 / (1024*1024);
+    float combined_mb_per_s = (filesize * 2.0 / (encrypt_time + decrypt_time)) * 1000000 / (1024*1024);
+    
+    pthread_mutex_lock(&print_mutex);
     printf("\n==========================================\n");
     printf("         IMAGE PROCESSING RESULTS         \n");
     printf("==========================================\n");
     printf("File: %s\n", filename);
-    printf("Size: %zu bytes\n", filesize);
-    printf("Encryption time: %lu µs\n", encrypt_time);
-    printf("Decryption time: %lu µs\n", decrypt_time);
-    printf("Throughput (encryption): %.2f MB/s\n", (filesize * 1.0 / encrypt_time) * 1000000 / (1024*1024));
-    printf("Throughput (decryption): %.2f MB/s\n", (filesize * 1.0 / decrypt_time) * 1000000 / (1024*1024));
+    printf("Size: %zu bytes (%.2f MB)\n", filesize, filesize / (1024.0*1024.0));
+    printf("Verification: %s\n", verification_success ? "✅ Success - Decryption verified" : "❌ Failed - Data mismatch");
+    
+    printf("\nPerformance:\n");
+    printf("Encryption time: %lu µs (%.2f ms)\n", encrypt_time, encrypt_time / 1000.0);
+    printf("Decryption time: %lu µs (%.2f ms)\n", decrypt_time, decrypt_time / 1000.0);
+    printf("Total processing time: %lu ms\n", total_time);
+    printf("Throughput (encryption): %.2f MB/s\n", enc_mb_per_s);
+    printf("Throughput (decryption): %.2f MB/s\n", dec_mb_per_s);
+    printf("Throughput (combined): %.2f MB/s\n", combined_mb_per_s);
+    
+    printf("\nPower metrics:\n");
+    printf("Current: %.2f mA\n", avg_current);
+    printf("Voltage: %.3f V\n", avg_voltage);
+    printf("Power: %.2f mW (%.6f W)\n", avg_power, avg_power / 1000.0);
+    printf("Energy consumption: %.2f mJ (%.6f J)\n", energy_mj, energy_j);
+    printf("Energy per byte: %.2f µJ/byte\n", energy_uj_per_byte);
+    printf("CPU usage: %.2f%% (crypto core: %.2f%%)\n", cpu_percent, core_usage);
+    
+    printf("\nOutput files:\n");
     printf("Encrypted file saved as: encrypted.bin\n");
-    printf("Decrypted file saved as: decrypted.jpg\n");
+    printf("Decrypted file saved as: %s\n", decrypted_filename);
     printf("==========================================\n");
+    pthread_mutex_unlock(&print_mutex);
     
     free(buffer);
     free(encrypted);
@@ -1341,6 +1486,17 @@ int main(int argc, char *argv[]) {
                         pthread_mutex_lock(&print_mutex);
                         printf("Benchmark aborted!\n");
                         pthread_mutex_unlock(&print_mutex);
+                    }
+                    else if (strncasecmp(input, "IMAGE", 5) == 0 && benchmark_state == BENCHMARK_IDLE) {
+                        char* filename = input + 6; // Skip "IMAGE " delen
+                        while (*filename && isspace(*filename)) filename++; // Hopp over mellomrom
+                        if (strlen(filename) > 0) {
+                            processImageFile(filename);
+                        } else {
+                            pthread_mutex_lock(&print_mutex);
+                            printf("Usage: IMAGE <filename>\n");
+                            pthread_mutex_unlock(&print_mutex);
+                        }
                     }
                     // Check if power measurement is requested
                     else if (strcasecmp(input, "POWER") == 0) {
