@@ -1070,16 +1070,29 @@ void finishBenchmark(void) {
     }
     pthread_mutex_unlock(&power_mutex);
 
-    // Skriv ut strømmålinger UTENFOR mutex-låsen
+    // Beregn flere energimetrikker med riktige konverteringer
+    float avg_power_w = avg_power / 1000.0;                    // mW til W
+    float energy_j = benchmark_total_energy / 1000.0;          // mJ til J
+    float energy_wh = benchmark_total_energy / 3600000.0;      // mJ til Wh
+    float crypto_energy_mj = (crypto_time_ms / 1000.0) * avg_power; // Energi brukt bare på krypto
+    float per_byte_energy = benchmark_total_energy / (benchmark_total_iterations * benchmark_padded_len); // mJ per byte
+
+    // Skriv ut strømmålinger UTENFOR mutex-låsen med alle detaljene
     printf("\n==========================================\n");
     printf("         POWER MEASUREMENTS              \n");
     printf("==========================================\n");
-    printf("Average current: %.2f mA\n", benchmark_avg_current);
+    printf("Average current: %.2f mA (%.6f A)\n", benchmark_avg_current, benchmark_avg_current / 1000.0);
     if (benchmark_min_current < 9999.0 && benchmark_max_current > 0) {
-        printf("Current range: %.2f - %.2f mA\n", benchmark_min_current, benchmark_max_current);
+    printf("Current range: %.2f - %.2f mA\n", benchmark_min_current, benchmark_max_current);
     }
-    printf("Average power: %.2f mW (%.3f W)\n", avg_power, avg_power / 1000.0);
-    printf("Energy consumption: %.2f mJ (%.5f Wh)\n", benchmark_total_energy, benchmark_total_energy / 3600000.0);
+    printf("Bus voltage: %.3f V\n", avg_voltage);
+    printf("Average power: %.2f mW (%.6f W)\n", avg_power, avg_power_w);
+    printf("Energy consumption: %.2f mJ (%.6f J)\n", benchmark_total_energy, energy_j);
+    printf("Energy in watt-hours: %.8f Wh\n", energy_wh);
+    printf("Energy per operation: %.6f mJ/op\n", benchmark_total_energy / benchmark_total_iterations);
+    printf("Energy per byte: %.6f µJ/byte\n", per_byte_energy * 1000.0);
+    printf("Crypto operations energy: %.2f mJ (%.2f%%)\n", crypto_energy_mj, 
+       (crypto_energy_mj / benchmark_total_energy) * 100.0);
     
     // Calculate total combined time and average
     unsigned long total_combined_time = benchmark_total_encrypt_time + benchmark_total_decrypt_time;
@@ -1131,13 +1144,16 @@ void finishBenchmark(void) {
     printf("\n==========================================\n");
     printf("         POWER MEASUREMENTS              \n");
     printf("==========================================\n");
-    printf("Average current: %.2f mA\n", benchmark_avg_current);
-    
+    printf("Average current: %.2f mA (%.6f A)\n", benchmark_avg_current, benchmark_avg_current / 1000.0);
+
     if (benchmark_min_current < 9999.0 && benchmark_max_current > 0) {
-        printf("Current range: %.2f - %.2f mA\n", benchmark_min_current, benchmark_max_current);
-    }
-    
-    printf("Energy consumption: %.2f mJ\n", benchmark_total_energy);
+    printf("Current range: %.2f - %.2f mA\n", benchmark_min_current, benchmark_max_current);
+}
+
+printf("Bus voltage: %.3f V\n", avg_voltage);
+printf("Energy consumption: %.2f mJ (%.6f J, %.8f Wh)\n", 
+       benchmark_total_energy, energy_j, energy_wh);
+printf("Energy efficiency: %.6f µJ/byte\n", per_byte_energy * 1000.0);
     
     if (benchmark_total_eval_time > 0) {
         printf("\n==========================================\n");
