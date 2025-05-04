@@ -733,6 +733,7 @@ int main(int argc, char *argv[])
               << "ThroughputDec=" << tp_d << " B/s\n"
               << "PeakRAM=" << ram << " bytes\n"
               << "ProgramSize=" << program_size << " bytes (run 'aarch64-linux-gnu-size chacha_bench_cbc_arm64' for accurate ROM usage)\n\n"
+              << "AvgPower=" << avg_p << " W\n"
               << "PowerSamples=" << sample_count << "\n"
               << "AvgCurrent=" << (avg_curr_A * 1000) << " mA\n"
               << "AvgVoltage=" << avg_volt_V << " V\n"
