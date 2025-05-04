@@ -1,5 +1,11 @@
 {
     "files.associations": {
+<<<<<<< HEAD
         "signal.h": "c"
+=======
+        "chrono": "cpp",
+        "cstring": "cpp",
+        "cerrno": "cpp"
+>>>>>>> cf1005e9c41bf23a3d49f7817225773cf9e7b967
     }
 }

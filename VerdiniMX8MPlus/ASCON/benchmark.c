@@ -1190,6 +1190,75 @@ printf("Energy efficiency: %.6f µJ/byte\n", per_byte_energy * 1000.0);
     // Add memory measurement at end
     measure_memory("After Benchmark");
 }
+// Legg denne funksjonen til rett før main-funksjonen
+void processImageFile(const char* filename) {
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        printf("Failed to open file: %s\n", filename);
+        return;
+    }
+    
+    // Les filstørrelse
+    fseek(fp, 0, SEEK_END);
+    size_t filesize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    
+    // Alloker buffer
+    unsigned char *buffer = malloc(filesize);
+    unsigned char *encrypted = malloc(filesize + IV_SIZE + TAG_SIZE);
+    unsigned char *decrypted = malloc(filesize);
+    
+    // Les filen
+    if (fread(buffer, 1, filesize, fp) != filesize) {
+        printf("Failed to read entire file\n");
+        fclose(fp);
+        free(buffer);
+        free(encrypted);
+        free(decrypted);
+        return;
+    }
+    fclose(fp);
+    
+    // Måling av minne før kryptering
+    measure_memory("Before Image Encryption");
+    
+    // Krypter data
+    unsigned long encrypt_time = encrypt(buffer, encrypted, filesize);
+    
+    // Dekrypter data
+    unsigned long decrypt_time = decrypt(encrypted, decrypted, filesize + IV_SIZE + TAG_SIZE);
+    
+    // Lagre kryptert fil
+    FILE *enc_fp = fopen("encrypted.bin", "wb");
+    fwrite(encrypted, 1, filesize + IV_SIZE + TAG_SIZE, enc_fp);
+    fclose(enc_fp);
+    
+    // Lagre dekryptert fil
+    FILE *dec_fp = fopen("decrypted.jpg", "wb");
+    fwrite(decrypted, 1, filesize, dec_fp);
+    fclose(dec_fp);
+    
+    // Måling av minne etter kryptering
+    measure_memory("After Image Processing");
+    
+    printf("\n==========================================\n");
+    printf("         IMAGE PROCESSING RESULTS         \n");
+    printf("==========================================\n");
+    printf("File: %s\n", filename);
+    printf("Size: %zu bytes\n", filesize);
+    printf("Encryption time: %lu µs\n", encrypt_time);
+    printf("Decryption time: %lu µs\n", decrypt_time);
+    printf("Throughput (encryption): %.2f MB/s\n", (filesize * 1.0 / encrypt_time) * 1000000 / (1024*1024));
+    printf("Throughput (decryption): %.2f MB/s\n", (filesize * 1.0 / decrypt_time) * 1000000 / (1024*1024));
+    printf("Encrypted file saved as: encrypted.bin\n");
+    printf("Decrypted file saved as: decrypted.jpg\n");
+    printf("==========================================\n");
+    
+    free(buffer);
+    free(encrypted);
+    free(decrypted);
+}
+
 
 int main(int argc, char *argv[]) {
     char input[1024];
