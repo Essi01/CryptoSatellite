@@ -187,7 +187,7 @@ double eval_expr(const std::string &expr)
 }
 
 // INA219 settings (via hwmon)
-static const char *HWMON_PATH = "/sys/class/hwmon/hwmon4";
+static const char *HWMON_PATH = "/sys/class/hwmon/hwmon3";
 
 class INA219
 {

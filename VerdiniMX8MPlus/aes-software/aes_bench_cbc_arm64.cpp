@@ -182,7 +182,7 @@ double eval_expr(const std::string &expr)
     return values.top();
 }
 
-static const char *HWMON_PATH = "/sys/class/hwmon/hwmon4";
+static const char *HWMON_PATH = "/sys/class/hwmon/hwmon3";
 
 class INA219
 {
