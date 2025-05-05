@@ -1,0 +1,861 @@
+#define _POSIX_C_SOURCE 200809L
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE // Enable GNU extensions for CPU_SET
+#endif
+#define NDEBUG // Disable debug output (if applicable)
+#include <chrono>
+#include <iostream>
+#include <vector>
+#include <cstdint>
+#include <string>
+#include <string.h> // For strerror
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <sys/resource.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sched.h> // For CPU_ZERO, CPU_SET
+#include <errno.h> // For errno
+#include <fstream>
+#include <sstream>
+#include <sys/stat.h> // For stat
+#include <stack>
+#include <cmath>
+#include <stdexcept>
+#include "aes.h"
+
+// INA219 settings (via hwmon)
+static const char *DEFAULT_HWMON_PATH = "/sys/class/hwmon/hwmon4";
+
+class INA219
+{
+    std::string power_path, current_path, voltage_path;
+    bool initialized;
+
+public:
+    INA219(const char *hwmon_path) : initialized(false)
+    {
+        power_path = std::string(hwmon_path) + "/power1_input";
+        current_path = std::string(hwmon_path) + "/curr1_input";
+        voltage_path = std::string(hwmon_path) + "/in1_input";
+        std::ifstream f_power(power_path);
+        if (!f_power.is_open())
+        {
+            std::cerr << "[DEBUG] Cannot open power file " << power_path << ": " << strerror(errno) << "\n";
+            return;
+        }
+        std::ifstream f_current(current_path);
+        if (!f_current.is_open())
+        {
+            std::cerr << "[DEBUG] Cannot open current file " << current_path << ": " << strerror(errno) << "\n";
+            return;
+        }
+        std::ifstream f_voltage(voltage_path);
+        if (!f_voltage.is_open())
+        {
+            std::cerr << "[DEBUG] Cannot open voltage file " << voltage_path << ": " << strerror(errno) << "\n";
+            return;
+        }
+        initialized = true;
+        std::cerr << "[DEBUG] INA219 initialized successfully\n";
+    }
+
+    bool begin()
+    {
+        if (!initialized)
+        {
+            std::cerr << "[DEBUG] INA219 begin failed: not initialized\n";
+            return false;
+        }
+        std::ifstream f_power(power_path);
+        std::ifstream f_current(current_path);
+        std::ifstream f_voltage(voltage_path);
+        bool accessible = f_power.is_open() && f_current.is_open() && f_voltage.is_open();
+        if (!accessible)
+        {
+            std::cerr << "[DEBUG] INA219 begin failed: power file accessible=" << f_power.is_open()
+                      << ", current file accessible=" << f_current.is_open()
+                      << ", voltage file accessible=" << f_voltage.is_open() << "\n";
+        }
+        else
+        {
+            std::cerr << "[DEBUG] INA219 begin successful\n";
+        }
+        return accessible;
+    }
+
+    // Dette er den rettede funksjonen med &-tegn for current_A-parameteret
+    bool readMeasurements(float &power_W, float &current_A, float &voltage_V)
+    {
+        if (!initialized)
+        {
+            std::cerr << "[DEBUG] readMeasurements failed: INA219 not initialized\n";
+            power_W = 0;
+            current_A = 0;
+            voltage_V = 0;
+            return false;
+        }
+        std::ifstream f_power(power_path);
+        if (!f_power.is_open())
+        {
+            std::cerr << "[DEBUG] Failed to read " << power_path << ": " << strerror(errno) << "\n";
+            power_W = 0;
+            current_A = 0;
+            voltage_V = 0;
+            return false;
+        }
+        std::string line;
+        std::getline(f_power, line);
+        try
+        {
+            power_W = std::stof(line) / 1000000.0f;
+            if (power_W < 0 || power_W > 10)
+            {
+                std::cerr << "[DEBUG] Invalid power reading: " << power_W << " W from " << power_path << ": " << line << "\n";
+                power_W = 0;
+                current_A = 0;
+                voltage_V = 0;
+                return false;
+            }
+        }
+        catch (...)
+        {
+            std::cerr << "[DEBUG] Invalid power reading from " << power_path << ": " << line << "\n";
+            power_W = 0;
+            current_A = 0;
+            voltage_V = 0;
+            return false;
+        }
+        std::ifstream f_current(current_path);
+        if (!f_current.is_open())
+        {
+            std::cerr << "[DEBUG] Failed to read " << current_path << ": " << strerror(errno) << "\n";
+            power_W = 0;
+            current_A = 0;
+            voltage_V = 0;
+            return false;
+        }
+        std::getline(f_current, line);
+        try
+        {
+            // Behold verdien i mikroampere uten konvertering
+            float raw_current_uA = std::stof(line);
+            if (raw_current_uA < 0 || raw_current_uA > 1000000) // Juster også sjekken for gyldige verdier
+            {
+                std::cerr << "[DEBUG] Invalid current reading: " << raw_current_uA
+                          << " μA from " << current_path << ": " << line << "\n";
+                power_W = 0;
+                current_A = 0;
+                voltage_V = 0;
+                return false;
+            }
+            current_A = raw_current_uA; // Lagre i mikroampere
+        }
+        catch (...)
+        {
+            std::cerr << "[DEBUG] Invalid current reading from " << current_path << ": " << line << "\n";
+            power_W = 0;
+            current_A = 0;
+            voltage_V = 0;
+            return false;
+        }
+        std::ifstream f_voltage(voltage_path);
+        if (!f_voltage.is_open())
+        {
+            std::cerr << "[DEBUG] Failed to read " << voltage_path << ": " << strerror(errno) << "\n";
+            power_W = 0;
+            current_A = 0;
+            voltage_V = 0;
+            return false;
+        }
+        std::getline(f_voltage, line);
+        try
+        {
+            voltage_V = std::stof(line) / 1000.0f;
+            if (voltage_V < 0 || voltage_V > 26)
+            {
+                std::cerr << "[DEBUG] Invalid voltage reading: " << voltage_V << " V from " << voltage_path << ": " << line << "\n";
+                power_W = 0;
+                current_A = 0;
+                voltage_V = 0;
+                return false;
+            }
+        }
+        catch (...)
+        {
+            std::cerr << "[DEBUG] Invalid voltage reading from " << voltage_path << ": " << line << "\n";
+            power_W = 0;
+            current_A = 0;
+            voltage_V = 0;
+            return false;
+        }
+        return true;
+    }
+};
+
+// Global INA219 object
+INA219 ina(DEFAULT_HWMON_PATH);
+
+// Power, current, voltage, and CPU sampling control
+std::atomic<bool> sampling{false};
+std::atomic<bool> cpu_sampling{false};
+std::vector<float> power_samples, current_samples, voltage_samples;
+std::vector<float> cpu_usage_samples;
+std::mutex samples_mtx;
+
+void verify_decryption(const std::vector<uint8_t> &pt, const std::vector<uint8_t> &dt, size_t data_len)
+{
+    std::string original(pt.begin(), pt.begin() + data_len);
+    std::string decrypted(dt.begin(), dt.begin() + data_len);
+    std::cout << "\n--- Verification ---\n";
+    std::cout << "Original : " << original << "\n";
+    std::cout << "Decrypted: " << decrypted << "\n";
+    if (original == decrypted)
+    {
+        std::cout << "✅ Match: Decryption successful\n";
+    }
+    else
+    {
+        std::cout << "❌ Mismatch: Decryption failed\n";
+    }
+}
+
+double eval_expr(const std::string &expr)
+{
+    std::stack<double> values;
+    std::stack<char> ops;
+    auto precedence = [](char op)
+    {
+        if (op == '+' || op == '-')
+            return 1;
+        if (op == '*' || op == '/')
+            return 2;
+        return 0;
+    };
+    auto apply_op = [](double a, double b, char op) -> double
+    {
+        switch (op)
+        {
+        case '+':
+            return a + b;
+        case '-':
+            return a - b;
+        case '*':
+            return a * b;
+        case '/':
+            if (b == 0.0)
+                throw std::runtime_error("Divide by zero");
+            return a / b;
+        default:
+            throw std::runtime_error("Unknown operator");
+        }
+    };
+    size_t i = 0;
+    while (i < expr.size())
+    {
+        char ch = expr[i];
+        if (std::isspace(ch))
+        {
+            ++i;
+            continue;
+        }
+        if (std::isdigit(ch) || ch == '.')
+        {
+            std::string num;
+            while (i < expr.size() && (std::isdigit(expr[i]) || expr[i] == '.'))
+            {
+                num += expr[i++];
+            }
+            try
+            {
+                values.push(std::stod(num));
+            }
+            catch (const std::exception &e)
+            {
+                throw std::runtime_error("Invalid number: " + num);
+            }
+            continue;
+        }
+        if (ch == '(')
+        {
+            ops.push(ch);
+        }
+        else if (ch == ')')
+        {
+            while (!ops.empty() && ops.top() != '(')
+            {
+                double b = values.top();
+                values.pop();
+                double a = values.top();
+                values.pop();
+                char op = ops.top();
+                ops.pop();
+                values.push(apply_op(a, b, op));
+            }
+            if (ops.empty() || ops.top() != '(')
+                throw std::runtime_error("Mismatched parentheses");
+            ops.pop(); // Remove '('
+        }
+        else if (ch == '+' || ch == '-' || ch == '*' || ch == '/')
+        {
+            while (!ops.empty() && precedence(ops.top()) >= precedence(ch))
+            {
+                double b = values.top();
+                values.pop();
+                double a = values.top();
+                values.pop();
+                char op = ops.top();
+                ops.pop();
+                values.push(apply_op(a, b, op));
+            }
+            ops.push(ch);
+        }
+        else
+        {
+            throw std::runtime_error(std::string("Invalid character: ") + ch);
+        }
+        ++i;
+    }
+    while (!ops.empty())
+    {
+        if (ops.top() == '(')
+            throw std::runtime_error("Unmatched opening parenthesis");
+        double b = values.top();
+        values.pop();
+        double a = values.top();
+        values.pop();
+        char op = ops.top();
+        ops.pop();
+        values.push(apply_op(a, b, op));
+    }
+    if (values.size() != 1)
+        throw std::runtime_error("Malformed expression");
+    return values.top();
+}
+
+// Pin thread to specific core
+void pin_to_core(int core_id)
+{
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    CPU_SET(core_id, &cpus);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus) != 0)
+    {
+        std::cerr << "Failed to pin thread to core " << core_id << ": " << strerror(errno) << "\n";
+    }
+}
+
+// Power-sampling thread
+void power_thread_fn()
+{
+    pin_to_core(1);
+    while (sampling.load())
+    {
+        float power_W, current_A, voltage_V;
+        if (ina.readMeasurements(power_W, current_A, voltage_V))
+        {
+            std::lock_guard<std::mutex> lk(samples_mtx);
+            power_samples.push_back(power_W);
+            current_samples.push_back(current_A);
+            voltage_samples.push_back(voltage_V);
+        }
+        else
+        {
+            std::this_thread::sleep_for(std::chrono::microseconds(1200));
+            continue;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(1200));
+    }
+}
+
+// CPU usage sampling thread
+// CPU usage sampling thread
+// CPU usage sampling thread
+void cpu_thread_fn()
+{
+    pin_to_core(2); // Denne tråden kjører på kjerne 2
+    std::ifstream proc_stat("/proc/stat");
+    if (!proc_stat.is_open())
+    {
+        std::cerr << "[DEBUG] Failed to open /proc/stat: " << strerror(errno) << "\n";
+        return;
+    }
+
+    // Endre dette til å måle cpu0 til "cpu" (alle kjerner)
+    uint64_t prev_total[4] = {0}, prev_idle[4] = {0};
+
+    while (cpu_sampling.load())
+    {
+        proc_stat.clear();
+        proc_stat.seekg(0);
+        std::string line;
+
+        // Les cpu (total) og cpu0, cpu1, cpu2 (individuelle kjerner)
+        int cpu_idx = 0;
+        while (std::getline(proc_stat, line) && cpu_idx < 4)
+        {
+            if (line.find("cpu") == 0 && (line[3] == ' ' || (line[3] >= '0' && line[3] <= '2')))
+            {
+                std::istringstream iss(line);
+                std::string cpu;
+                uint64_t user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice;
+                iss >> cpu >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal >> guest >> guest_nice;
+
+                uint64_t total = user + nice + system + idle + iowait + irq + softirq + steal + guest + guest_nice;
+                uint64_t idle_time = idle + iowait;
+
+                if (prev_total[cpu_idx] != 0)
+                {
+                    uint64_t delta_total = total - prev_total[cpu_idx];
+                    uint64_t delta_idle = idle_time - prev_idle[cpu_idx];
+                    float usage = delta_total ? 100.0f * (delta_total - delta_idle) / delta_total : 0.0f;
+
+                    {
+                        std::lock_guard<std::mutex> lk(samples_mtx);
+                        if (cpu_idx == 0) // Total CPU
+                            cpu_usage_samples.push_back(usage);
+
+                        // Legg til debug-utskrift
+                        std::string cpu_name = (cpu_idx == 0) ? "Total" : "cpu" + std::to_string(cpu_idx - 1);
+                        std::cerr << "[DEBUG] " << cpu_name << " usage: " << usage << "%, samples: " << (cpu_idx == 0 ? cpu_usage_samples.size() : cpu_idx) << "\n";
+                    }
+                }
+
+                prev_total[cpu_idx] = total;
+                prev_idle[cpu_idx] = idle_time;
+                cpu_idx++;
+            }
+        }
+
+        // Økt søvntid fra 100ms til 500ms for å redusere antall målinger
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+}
+
+// Function to join a thread with a timeout
+bool join_thread_with_timeout(std::thread &t, int timeout_ms)
+{
+    auto start = std::chrono::steady_clock::now();
+    while (std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start)
+               .count() < timeout_ms)
+    {
+        if (t.joinable())
+        {
+            t.join();
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    std::cerr << "Warning: Thread join timed out after " << timeout_ms << " ms\n";
+    return false;
+}
+void processImageFile(const char *filename)
+{
+    FILE *fp = fopen(filename, "rb");
+    if (!fp)
+    {
+        std::cerr << "Failed to open file: " << filename << std::endl;
+        return;
+    }
+
+    // Få filutvidelse for utdatafilen
+    std::string file_extension = ".jpg";
+    const char *dot = strrchr(filename, '.');
+    if (dot && strlen(dot) < 15)
+    {
+        file_extension = dot;
+    }
+
+    // Opprett filnavn for dekryptert fil
+    std::string decrypted_filename = "decrypted" + file_extension;
+
+    // Les filstørrelse
+    fseek(fp, 0, SEEK_END);
+    size_t filesize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    std::cout << "\nStarting image encryption for " << filename << " (" << filesize << " bytes)..." << std::endl;
+
+    // Alloker buffere
+    std::vector<uint8_t> buffer(filesize, 0);
+    size_t padded_size = ((filesize + AES_BLOCKLEN - 1) / AES_BLOCKLEN) * AES_BLOCKLEN;
+    std::vector<uint8_t> padded_buffer(padded_size, 0);
+    std::vector<uint8_t> encrypted(padded_size, 0);
+    std::vector<uint8_t> decrypted(padded_size, 0);
+
+    // Les filen
+    if (fread(buffer.data(), 1, filesize, fp) != filesize)
+    {
+        std::cerr << "Failed to read entire file" << std::endl;
+        fclose(fp);
+        return;
+    }
+    fclose(fp);
+
+    // Kopier til padded buffer
+    memcpy(padded_buffer.data(), buffer.data(), filesize);
+
+    // Initialiser INA219 og power sampling
+    bool power_sampling_enabled = ina.begin();
+    std::thread pwr_thread;
+    std::thread cpu_thread;
+
+    // Start power og CPU-tråder
+    power_samples.clear();
+    current_samples.clear();
+    voltage_samples.clear();
+    cpu_usage_samples.clear();
+
+    if (power_sampling_enabled)
+    {
+        sampling.store(true);
+        pwr_thread = std::thread(power_thread_fn);
+    }
+    cpu_sampling.store(true);
+    cpu_thread = std::thread(cpu_thread_fn);
+
+    // Lag AES-nøkkel og initialisering
+    uint8_t key[AES_KEYLEN], iv[AES_BLOCKLEN] = {0};
+    for (size_t i = 0; i < AES_KEYLEN; i++)
+        key[i] = uint8_t(i);
+
+    // Start timing
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    // Krypter bildedata
+    struct AES_ctx ctx_enc;
+    AES_init_ctx_iv(&ctx_enc, key, iv);
+    memcpy(encrypted.data(), padded_buffer.data(), padded_size);
+    AES_CBC_encrypt_buffer(&ctx_enc, encrypted.data(), padded_size);
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    // Dekrypter data
+    struct AES_ctx ctx_dec;
+    AES_init_ctx_iv(&ctx_dec, key, iv);
+    memcpy(decrypted.data(), encrypted.data(), padded_size);
+    AES_CBC_decrypt_buffer(&ctx_dec, decrypted.data(), padded_size);
+
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    // Verifiser dekryptering
+    bool verification_success = true;
+    for (size_t i = 0; i < filesize; i++)
+    {
+        if (buffer[i] != decrypted[i])
+        {
+            verification_success = false;
+            break;
+        }
+    }
+
+    // Lagre kryptert fil
+    FILE *enc_fp = fopen("encrypted.bin", "wb");
+    if (enc_fp)
+    {
+        fwrite(encrypted.data(), 1, padded_size, enc_fp);
+        fclose(enc_fp);
+    }
+    else
+    {
+        std::cerr << "Failed to create encrypted file" << std::endl;
+    }
+
+    // Lagre dekryptert fil
+    FILE *dec_fp = fopen(decrypted_filename.c_str(), "wb");
+    if (dec_fp)
+    {
+        fwrite(decrypted.data(), 1, filesize, dec_fp);
+        fclose(dec_fp);
+    }
+    else
+    {
+        std::cerr << "Failed to create decrypted file" << std::endl;
+    }
+
+    // Stopp sampling
+    sampling.store(false);
+    cpu_sampling.store(false);
+
+    // Join tråder
+    if (power_sampling_enabled)
+    {
+        if (!join_thread_with_timeout(pwr_thread, 5000))
+        {
+            std::cerr << "Power thread failed to join" << std::endl;
+        }
+    }
+    if (!join_thread_with_timeout(cpu_thread, 5000))
+    {
+        std::cerr << "CPU thread failed to join" << std::endl;
+    }
+
+    // Beregn ytelsesmetrikker
+    double encrypt_time_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    double decrypt_time_us = std::chrono::duration<double, std::micro>(t2 - t1).count();
+    double total_time_ms = std::chrono::duration<double, std::milli>(t2 - t0).count();
+
+    // Beregn gjennomstrømning
+    double enc_mb_per_s = (filesize * 1.0 / encrypt_time_us) * 1000000 / (1024 * 1024);
+    double dec_mb_per_s = (filesize * 1.0 / decrypt_time_us) * 1000000 / (1024 * 1024);
+
+    // Beregn strøm og energi
+    double power_sum = 0, current_sum = 0, voltage_sum = 0, cpu_sum = 0;
+    size_t sample_count = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(samples_mtx);
+        sample_count = power_samples.size();
+        for (size_t i = 0; i < sample_count; ++i)
+        {
+            power_sum += power_samples[i];
+            current_sum += current_samples[i];
+            voltage_sum += voltage_samples[i];
+        }
+        for (float usage : cpu_usage_samples)
+        {
+            cpu_sum += usage;
+        }
+    }
+
+    double avg_p = sample_count ? power_sum / sample_count : 0;
+    double avg_curr = sample_count ? current_sum / sample_count : 0;
+    double avg_volt = sample_count ? voltage_sum / sample_count : 0;
+    double avg_cpu = cpu_usage_samples.empty() ? 0 : cpu_sum / cpu_usage_samples.size();
+    double dur_s = total_time_ms / 1000.0;
+    double energy_j = avg_p * dur_s;
+
+    // Skriv ut resultater
+    std::cout << "\n==========================================\n";
+    std::cout << "         IMAGE PROCESSING RESULTS         \n";
+    std::cout << "==========================================\n";
+    std::cout << "File: " << filename << "\n";
+    std::cout << "Size: " << filesize << " bytes (" << (filesize / 1024.0) << " KB)\n";
+    std::cout << "Verification: " << (verification_success ? "✅ Success - Decryption verified" : "❌ Failed - Data mismatch") << "\n";
+
+    std::cout << "\nPerformance:\n";
+    std::cout << "Encryption time: " << encrypt_time_us << " µs (" << (encrypt_time_us / 1000.0) << " ms)\n";
+    std::cout << "Decryption time: " << decrypt_time_us << " µs (" << (decrypt_time_us / 1000.0) << " ms)\n";
+    std::cout << "Total processing time: " << total_time_ms << " ms\n";
+    std::cout << "Throughput (encryption): " << enc_mb_per_s << " MB/s\n";
+    std::cout << "Throughput (decryption): " << dec_mb_per_s << " MB/s\n";
+
+    std::cout << "\nPower metrics:\n";
+    std::cout << "Current: " << avg_curr << " μA\n";
+    std::cout << "Voltage: " << avg_volt << " V\n";
+    std::cout << "Power: " << (avg_p * 1000.0) << " mW (" << avg_p << " W)\n";
+    std::cout << "Energy consumption: " << (energy_j * 1000.0) << " mJ (" << energy_j << " J)\n";
+    std::cout << "Energy per byte: " << ((energy_j * 1000000.0) / filesize) << " μJ/byte\n";
+    std::cout << "CPU usage: " << avg_cpu << " %\n";
+
+    std::cout << "\nOutput files:\n";
+    std::cout << "Encrypted file saved as: encrypted.bin\n";
+    std::cout << "Decrypted file saved as: " << decrypted_filename << "\n";
+    std::cout << "==========================================\n";
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc < 3)
+    {
+        std::cerr << "Usage: " << argv[0] << " <iterations> <plaintext> [<hwmon_path>]\n";
+        return 1;
+    }
+
+    // Add the image processing code right here, before any other processing
+    if (argc == 3 && strcmp(argv[2], "-image") == 0)
+    {
+        processImageFile(argv[1]);
+        return 0;
+    }
+
+    size_t iterations;
+    try
+    {
+        iterations = std::stoul(argv[1]);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Invalid iterations: " << argv[1] << "\n";
+        return 1;
+    }
+    std::string plain = argv[2];
+    // Determine HWMON_PATH
+    const char *hwmon_path = DEFAULT_HWMON_PATH;
+    if (argc >= 4)
+    {
+        hwmon_path = argv[3];
+    }
+    else if (const char *env_hwmon = std::getenv("HWMON_PATH"))
+    {
+        hwmon_path = env_hwmon;
+    }
+    // Pin main thread to core 0
+    pin_to_core(0);
+    // Init INA219
+    bool power_sampling_enabled = ina.begin();
+    if (!power_sampling_enabled)
+    {
+        std::cerr << "Warning: Power and current sampling disabled due to INA219 failure\n";
+    }
+    // Prepare data
+    const size_t BLOCK_SIZE = AES_BLOCKLEN, KEY_SIZE = AES_KEYLEN;
+    size_t data_len = plain.size(),
+           pad_len = ((data_len + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    std::vector<uint8_t> pt(pad_len, 0), ct(pad_len), dt(pad_len);
+    memcpy(pt.data(), plain.data(), data_len);
+    uint8_t key[KEY_SIZE], iv[BLOCK_SIZE] = {0};
+    for (size_t i = 0; i < KEY_SIZE; i++)
+        key[i] = uint8_t(i);
+    // Reserve space for sample vectors
+    power_samples.reserve(1000);
+    current_samples.reserve(1000);
+    voltage_samples.reserve(1000);
+    cpu_usage_samples.reserve(1000);
+    // Start power and CPU threads
+    std::thread pwr_thread;
+    if (power_sampling_enabled)
+    {
+        sampling.store(true);
+        pwr_thread = std::thread(power_thread_fn);
+    }
+    cpu_sampling.store(true);
+    std::thread cpu_thread(cpu_thread_fn);
+    // Capture baseline
+    auto t0 = std::chrono::high_resolution_clock::now();
+    // Encryption
+    for (size_t it = 0; it < iterations; ++it)
+    {
+        struct AES_ctx ctx;
+        AES_init_ctx_iv(&ctx, key, iv);
+        memcpy(ct.data(), pt.data(), pad_len);
+        AES_CBC_encrypt_buffer(&ctx, ct.data(), pad_len);
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    // Decryption
+    for (size_t it = 0; it < iterations; ++it)
+    {
+        struct AES_ctx ctx;
+        AES_init_ctx_iv(&ctx, key, iv);
+        memcpy(dt.data(), ct.data(), pad_len);
+        AES_CBC_decrypt_buffer(&ctx, dt.data(), pad_len);
+    }
+    auto t3 = std::chrono::high_resolution_clock::now();
+    // Stop sampling
+    sampling.store(false);
+    cpu_sampling.store(false);
+    // Join threads with timeout
+    if (power_sampling_enabled)
+    {
+        if (!join_thread_with_timeout(pwr_thread, 5000))
+        {
+            std::cerr << "Power thread failed to join\n";
+        }
+    }
+    if (!join_thread_with_timeout(cpu_thread, 5000))
+    {
+        std::cerr << "CPU thread failed to join\n";
+    }
+    // Get RAM usage
+    struct rusage ru_end;
+    getrusage(RUSAGE_SELF, &ru_end);
+    // Get program size
+    struct stat st;
+    off_t program_size = 0;
+    if (stat("./aes_bench_cbc_arm64", &st) == 0)
+    {
+        program_size = st.st_size;
+    }
+    else
+    {
+        std::cerr << "Failed to get program size: " << strerror(errno) << "\n";
+        std::cerr << "Run 'aarch64-linux-gnu-size aes_bench_cbc_arm64' for accurate ROM usage.\n";
+    }
+    // Compute power, current, voltage, and CPU stats
+    double power_sum = 0, current_sum = 0, voltage_sum = 0, cpu_sum = 0;
+    size_t sample_count = 0;
+    {
+        std::lock_guard<std::mutex> lk(samples_mtx);
+        sample_count = power_samples.size();
+        for (size_t i = 0; i < sample_count; ++i)
+        {
+            power_sum += power_samples[i];
+            current_sum += current_samples[i];
+            voltage_sum += voltage_samples[i];
+        }
+        for (float usage : cpu_usage_samples)
+        {
+            cpu_sum += usage;
+        }
+    }
+    double avg_p = sample_count ? power_sum / sample_count : 0;
+    double avg_curr_A = sample_count ? current_sum / sample_count : 0;
+    double avg_volt_V = sample_count ? voltage_sum / sample_count : 0;
+    double avg_cpu = cpu_usage_samples.empty() ? 0 : cpu_sum / cpu_usage_samples.size();
+    double dur_s = std::chrono::duration<double>(t3 - t0).count();
+    double e_J = avg_p * dur_s;
+    // Timing
+    double enc_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    double dec_us = std::chrono::duration<double, std::micro>(t3 - t1).count();
+    double latency_e = iterations ? enc_us / iterations : 0;
+    double latency_d = iterations ? dec_us / iterations : 0;
+    double tp_e = latency_e ? (pad_len * 1e6) / latency_e : 0;
+    double tp_d = latency_d ? (pad_len * 1e6) / latency_d : 0;
+    long ram = ru_end.ru_maxrss * 1024;
+    verify_decryption(pt, dt, data_len);
+    // Sanitize decrypted string
+    std::string decrypted;
+    for (size_t i = 0; i < data_len; ++i)
+        if (dt[i] >= 32 && dt[i] <= 126)
+            decrypted += static_cast<char>(dt[i]);
+    std::cout << "[DEBUG] Decrypted length: " << decrypted.size() << "\n";
+    std::cout << "[DEBUG] Decrypted content: " << decrypted << "\n";
+    // Evaluate expression if ends with "=?"
+    if (decrypted.size() > 2 && decrypted.substr(decrypted.size() - 2) == "=?")
+    {
+        std::string expr = decrypted.substr(0, decrypted.size() - 2);
+        if (expr.empty())
+            throw std::runtime_error("Empty expression");
+        int balance = 0;
+        for (char c : expr)
+        {
+            if (c == '(')
+                balance++;
+            else if (c == ')')
+                balance--;
+            if (balance < 0)
+                throw std::runtime_error("Unmatched closing parenthesis");
+        }
+        if (balance != 0)
+            throw std::runtime_error("Unbalanced parentheses");
+        try
+        {
+            double result = eval_expr(expr);
+            std::cout << "🧮 Expression Result: " << result << "\n";
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Expression evaluation error: " << e.what() << "\n";
+        }
+    }
+    std::cout << "---------------------\n"
+              << "Iterations=" << iterations << "\n"
+              << "Enc=" << enc_us << " us\n"
+              << "Dec=" << dec_us << " us\n"
+              << "LatencyEnc=" << latency_e << " us\n"
+              << "LatencyDec=" << latency_d << " us\n"
+              << "ThroughputEnc=" << tp_e << " B/s\n"
+              << "ThroughputDec=" << tp_d << " B/s\n"
+              << "PeakRAM=" << ram << " bytes\n"
+              << "ProgramSize=" << program_size << " bytes (run 'aarch64-linux-gnu-size aes_bench_cbc_arm64' for accurate ROM usage)\n\n"
+              << "PowerSamples=" << sample_count << "\n"
+              << "AvgCurrent=" << avg_curr_A << " μA\n" // Endret fra (avg_curr_A * 1000) << " mA"
+              << "AvgVoltage=" << avg_volt_V << " V\n"
+              << "AvgCPUUsage=" << avg_cpu << " %\n"
+              << "Energy=" << e_J << " J\n"
+              << "---------------------\n";
+    return 0;
+}
