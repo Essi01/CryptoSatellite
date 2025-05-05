@@ -26,8 +26,23 @@
 #include <cmath>
 #include <stdexcept>
 #include <filesystem>
+#include <sys/ioctl.h>
+#include <linux/i2c-dev.h> // For I2C communication
+#include <linux/i2c.h>     // For I2C structs
 
 #include "aes.h"
+
+// INA226 I2C address and register definitions
+#define INA226_ADDRESS 0x40
+#define INA226_REG_CONFIG 0x00
+#define INA226_REG_SHUNT_VOLTAGE 0x01
+#define INA226_REG_BUS_VOLTAGE 0x02
+#define INA226_REG_POWER 0x03
+#define INA226_REG_CURRENT 0x04
+#define INA226_REG_CALIBRATION 0x05
+#define INA226_SHUNT_RESISTOR 0.1f                    // 0.1 Ohm shunt resistor
+#define INA226_CURRENT_LSB 0.0001f                    // 100 uA per LSB (adjust based on calibration)
+#define INA226_POWER_LSB (25.0f * INA226_CURRENT_LSB) // Power LSB = 25 * Current LSB
 
 void verify_decryption(const std::vector<uint8_t> &pt, const std::vector<uint8_t> &dt, size_t data_len, bool is_image, const std::string &output_image_path = "")
 {
@@ -182,165 +197,203 @@ double eval_expr(const std::string &expr)
     return values.top();
 }
 
-static const char *HWMON_PATH = "/sys/class/hwmon/hwmon4";
-
-class INA219
+class INA226
 {
-    std::string power_path, current_path, voltage_path;
+    int i2c_fd;
     bool initialized;
 
-public:
-    INA219(const char *hwmon_path) : initialized(false)
+    // Write to INA226 register
+    bool write_register(uint8_t reg, uint16_t value)
     {
-        power_path = std::string(hwmon_path) + "/power1_input";
-        current_path = std::string(hwmon_path) + "/curr1_input";
-        voltage_path = std::string(hwmon_path) + "/in1_input";
-        std::ifstream f_power(power_path);
-        if (!f_power.is_open())
+        struct i2c_msg messages[1];
+        struct i2c_rdwr_ioctl_data packets;
+        uint8_t buf[3];
+
+        buf[0] = reg;
+        buf[1] = (value >> 8) & 0xFF; // MSB
+        buf[2] = value & 0xFF;        // LSB
+
+        messages[0].addr = INA226_ADDRESS;
+        messages[0].flags = 0; // Write
+        messages[0].len = 3;
+        messages[0].buf = buf;
+
+        packets.msgs = messages;
+        packets.nmsgs = 1;
+
+        if (ioctl(i2c_fd, I2C_RDWR, &packets) < 0)
         {
-            std::cerr << "[DEBUG] Cannot open power file " << power_path << ": " << strerror(errno) << "\n";
+            std::cerr << "[DEBUG] Failed to write to INA226 register 0x" << std::hex << (int)reg << ": " << strerror(errno) << "\n";
+            return false;
+        }
+        return true;
+    }
+
+    // Read from INA226 register
+    bool read_register(uint8_t reg, uint16_t &value)
+    {
+        struct i2c_msg messages[2];
+        struct i2c_rdwr_ioctl_data packets;
+        uint8_t reg_buf[1] = {reg};
+        uint8_t data[2];
+
+        // Write register address
+        messages[0].addr = INA226_ADDRESS;
+        messages[0].flags = 0; // Write
+        messages[0].len = 1;
+        messages[0].buf = reg_buf;
+
+        // Read data
+        messages[1].addr = INA226_ADDRESS;
+        messages[1].flags = I2C_M_RD; // Read
+        messages[1].len = 2;
+        messages[1].buf = data;
+
+        packets.msgs = messages;
+        packets.nmsgs = 2;
+
+        if (ioctl(i2c_fd, I2C_RDWR, &packets) < 0)
+        {
+            std::cerr << "[DEBUG] Failed to read from INA226 register 0x" << std::hex << (int)reg << ": " << strerror(errno) << "\n";
+            return false;
+        }
+
+        value = (data[0] << 8) | data[1];
+        return true;
+    }
+
+public:
+    INA226(const char *i2c_device = "/dev/i2c-1") : i2c_fd(-1), initialized(false)
+    {
+        // Open I2C device
+        i2c_fd = open(i2c_device, O_RDWR);
+        if (i2c_fd < 0)
+        {
+            std::cerr << "[DEBUG] Cannot open I2C device " << i2c_device << ": " << strerror(errno) << "\n";
             return;
         }
-        std::ifstream f_current(current_path);
-        if (!f_current.is_open())
+
+        // Configure INA226: Continuous mode, 1 sample averaging, 1.1ms conversion time
+        uint16_t config = (0x4 << 13) | // Operating mode: Continuous shunt and bus
+                          (0x4 << 9) |  // Shunt voltage conversion time: 1.1ms
+                          (0x4 << 6) |  // Bus voltage conversion time: 1.1ms
+                          (0x0 << 3) |  // Averaging: 1 sample
+                          (0x7);        // Reserved
+        if (!write_register(INA226_REG_CONFIG, config))
         {
-            std::cerr << "[DEBUG] Cannot open current file " << current_path << ": " << strerror(errno) << "\n";
+            std::cerr << "[DEBUG] Failed to configure INA226\n";
+            close(i2c_fd);
+            i2c_fd = -1;
             return;
         }
-        std::ifstream f_voltage(voltage_path);
-        if (!f_voltage.is_open())
+
+        // Set calibration register
+        // Current_LSB = 100uA, Max current = 0.8A, Shunt = 0.1 Ohm
+        // Calibration = 0.00512 / (Current_LSB * Shunt) = 0.00512 / (0.0001 * 0.1) = 512
+        uint16_t calibration = 512;
+        if (!write_register(INA226_REG_CALIBRATION, calibration))
         {
-            std::cerr << "[DEBUG] Cannot open voltage file " << voltage_path << ": " << strerror(errno) << "\n";
+            std::cerr << "[DEBUG] Failed to set INA226 calibration\n";
+            close(i2c_fd);
+            i2c_fd = -1;
             return;
         }
+
         initialized = true;
-        std::cerr << "[DEBUG] INA219 initialized successfully\n";
+        std::cerr << "[DEBUG] INA226 initialized successfully\n";
+    }
+
+    ~INA226()
+    {
+        if (i2c_fd >= 0)
+        {
+            close(i2c_fd);
+        }
     }
 
     bool begin()
     {
         if (!initialized)
         {
-            std::cerr << "[DEBUG] INA219 begin failed: not initialized\n";
+            std::cerr << "[DEBUG] INA226 begin failed: not initialized\n";
             return false;
         }
-        std::ifstream f_power(power_path);
-        std::ifstream f_current(current_path);
-        std::ifstream f_voltage(voltage_path);
-        bool accessible = f_power.is_open() && f_current.is_open() && f_voltage.is_open();
-        if (!accessible)
+        // Verify communication by reading configuration
+        uint16_t config;
+        if (!read_register(INA226_REG_CONFIG, config))
         {
-            std::cerr << "[DEBUG] INA219 begin failed: power file accessible=" << f_power.is_open()
-                      << ", current file accessible=" << f_current.is_open()
-                      << ", voltage file accessible=" << f_voltage.is_open() << "\n";
+            std::cerr << "[DEBUG] INA226 begin failed: cannot read configuration\n";
+            return false;
         }
-        else
-        {
-            std::cerr << "[DEBUG] INA219 begin successful\n";
-        }
-        return accessible;
+        std::cerr << "[DEBUG] INA226 begin successful\n";
+        return true;
     }
 
     bool readMeasurements(float &power_W, float &current_A, float &voltage_V)
     {
         if (!initialized)
         {
-            std::cerr << "[DEBUG] readMeasurements failed: INA219 not initialized\n";
+            std::cerr << "[DEBUG] readMeasurements failed: INA226 not initialized\n";
             power_W = 0;
             current_A = 0;
             voltage_V = 0;
             return false;
         }
 
-        std::ifstream f_power(power_path);
-        if (!f_power.is_open())
+        // Read bus voltage (1.25mV per LSB)
+        uint16_t bus_voltage_raw;
+        if (!read_register(INA226_REG_BUS_VOLTAGE, bus_voltage_raw))
         {
-            std::cerr << "[DEBUG] Failed to read " << power_path << ": " << strerror(errno) << "\n";
+            std::cerr << "[DEBUG] Failed to read bus voltage\n";
             power_W = 0;
             current_A = 0;
             voltage_V = 0;
             return false;
         }
-        std::string line;
-        std::getline(f_power, line);
-        try
+        voltage_V = bus_voltage_raw * 0.00125f; // Convert to volts
+        if (voltage_V < 0 || voltage_V > 36)
         {
-            power_W = std::stof(line) / 1000000.0f;
-            if (power_W < 0 || power_W > 10)
-            {
-                std::cerr << "[DEBUG] Invalid power reading: " << power_W << " W from " << power_path << ": " << line << "\n";
-                power_W = 0;
-                current_A = 0;
-                voltage_V = 0;
-                return false;
-            }
-        }
-        catch (...)
-        {
-            std::cerr << "[DEBUG] Invalid power reading from " << power_path << ": " << line << "\n";
+            std::cerr << "[DEBUG] Invalid voltage reading: " << voltage_V << " V\n";
             power_W = 0;
             current_A = 0;
             voltage_V = 0;
             return false;
         }
 
-        std::ifstream f_current(current_path);
-        if (!f_current.is_open())
+        // Read current (100uA per LSB)
+        uint16_t current_raw;
+        if (!read_register(INA226_REG_CURRENT, current_raw))
         {
-            std::cerr << "[DEBUG] Failed to read " << current_path << ": " << strerror(errno) << "\n";
+            std::cerr << "[DEBUG] Failed to read current\n";
             power_W = 0;
             current_A = 0;
             voltage_V = 0;
             return false;
         }
-        std::getline(f_current, line);
-        try
+        current_A = (int16_t)current_raw * INA226_CURRENT_LSB; // Convert to amps
+        if (current_A < -0.8f || current_A > 0.8f)
         {
-            float raw_current_A = std::stof(line) / 1000000.0f;
-            if (raw_current_A < 0 || raw_current_A > 1)
-            {
-                std::cerr << "[DEBUG] Invalid current reading: " << raw_current_A << " A from " << current_path << ": " << line << "\n";
-                power_W = 0;
-                current_A = 0;
-                voltage_V = 0;
-                return false;
-            }
-            current_A = raw_current_A;
-        }
-        catch (...)
-        {
-            std::cerr << "[DEBUG] Invalid current reading from " << current_path << ": " << line << "\n";
+            std::cerr << "[DEBUG] Invalid current reading: " << current_A << " A\n";
             power_W = 0;
             current_A = 0;
             voltage_V = 0;
             return false;
         }
 
-        std::ifstream f_voltage(voltage_path);
-        if (!f_voltage.is_open())
+        // Read power (Power_LSB = 25 * Current_LSB)
+        uint16_t power_raw;
+        if (!read_register(INA226_REG_POWER, power_raw))
         {
-            std::cerr << "[DEBUG] Failed to read " << voltage_path << ": " << strerror(errno) << "\n";
+            std::cerr << "[DEBUG] Failed to read power\n";
             power_W = 0;
             current_A = 0;
             voltage_V = 0;
             return false;
         }
-        std::getline(f_voltage, line);
-        try
+        power_W = power_raw * INA226_POWER_LSB; // Convert to watts
+        if (power_W < 0 || power_W > 10)
         {
-            voltage_V = std::stof(line) / 1000.0f;
-            if (voltage_V < 0 || voltage_V > 26)
-            {
-                std::cerr << "[DEBUG] Invalid voltage reading: " << voltage_V << " V from " << voltage_path << ": " << line << "\n";
-                power_W = 0;
-                current_A = 0;
-                voltage_V = 0;
-                return false;
-            }
-        }
-        catch (...)
-        {
-            std::cerr << "[DEBUG] Invalid voltage reading from " << voltage_path << ": " << line << "\n";
+            std::cerr << "[DEBUG] Invalid power reading: " << power_W << " W\n";
             power_W = 0;
             current_A = 0;
             voltage_V = 0;
@@ -351,7 +404,7 @@ public:
     }
 };
 
-INA219 ina(HWMON_PATH);
+INA226 ina("/dev/i2c-3");
 
 std::atomic<bool> sampling{false};
 std::atomic<bool> cpu_sampling{false};
@@ -517,7 +570,7 @@ int main(int argc, char *argv[])
     bool power_sampling_enabled = ina.begin();
     if (!power_sampling_enabled)
     {
-        std::cerr << "Warning: Power and current sampling disabled due to INA219 failure\n";
+        std::cerr << "Warning: Power and current sampling disabled due to INA226 failure\n";
     }
 
     const size_t BLOCK_SIZE = AES_BLOCKLEN, KEY_SIZE = AES_KEYLEN;
