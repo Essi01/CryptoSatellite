@@ -64,6 +64,7 @@
         "future": "cpp",
         "cinttypes": "cpp",
         "variant": "cpp",
-        "codecvt": "cpp"
+        "codecvt": "cpp",
+        "locale": "c"
     }
 }

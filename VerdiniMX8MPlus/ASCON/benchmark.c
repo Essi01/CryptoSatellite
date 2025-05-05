@@ -1473,7 +1473,6 @@ int main(int argc, char *argv[]) {
                     printf("> %s\n", input);
                     pthread_mutex_unlock(&print_mutex);
                     
-                    // Check if benchmark should be stopped
                     if (strcasecmp(input, "STOP") == 0 && benchmark_state == BENCHMARK_RUNNING) {
                         pthread_mutex_lock(&print_mutex);
                         printf("Aborting benchmark...\n");
@@ -1487,17 +1486,6 @@ int main(int argc, char *argv[]) {
                         printf("Benchmark aborted!\n");
                         pthread_mutex_unlock(&print_mutex);
                     }
-                    else if (strncasecmp(input, "IMAGE", 5) == 0 && benchmark_state == BENCHMARK_IDLE) {
-                        char* filename = input + 6; // Skip "IMAGE " delen
-                        while (*filename && isspace(*filename)) filename++; // Hopp over mellomrom
-                        if (strlen(filename) > 0) {
-                            processImageFile(filename);
-                        } else {
-                            pthread_mutex_lock(&print_mutex);
-                            printf("Usage: IMAGE <filename>\n");
-                            pthread_mutex_unlock(&print_mutex);
-                        }
-                    }
                     // Check if power measurement is requested
                     else if (strcasecmp(input, "POWER") == 0) {
                         read_power_measurements();
@@ -1505,6 +1493,33 @@ int main(int argc, char *argv[]) {
                     // Check if matrix report is requested
                     else if (strcasecmp(input, "MATRIX") == 0) {
                         generate_matrix_report();
+                    }
+                    // IMAGE command handler (for bitmap files)
+                    else if (strncasecmp(input, "IMAGE", 5) == 0 && benchmark_state == BENCHMARK_IDLE) {
+                        // Parse command: IMAGE <iterations> <filename>
+                        char* token = input + 5;
+                        while (*token && isspace(*token)) token++; // Skip spaces
+                        
+                        // Get iterations
+                        char* iterations_str = token;
+                        while (*token && !isspace(*token)) token++;
+                        if (*token) {
+                            *token++ = '\0'; // Terminate iterations string
+                            while (*token && isspace(*token)) token++; // Skip spaces
+                        }
+                        
+                        // Get filename
+                        char* filename = token;
+                        
+                        // Convert iterations to number
+                        int iterations = atoi(iterations_str);
+                        if (iterations <= 0 || strlen(filename) == 0) {
+                            pthread_mutex_lock(&print_mutex);
+                            printf("Usage: IMAGE <iterations> <filename>\n");
+                            pthread_mutex_unlock(&print_mutex);
+                        } else {
+                            processImageFile(filename, iterations);
+                        }
                     }
                     // Check if it's a repeat command with flexible formatting
                     else if ((strncasecmp(input, "REPEAT", 6) == 0) && benchmark_state == BENCHMARK_IDLE) {
@@ -1552,7 +1567,7 @@ int main(int argc, char *argv[]) {
                     }
                     else {
                         // Measure memory at the start of encryption
-                        measure_memory("Before Single Encryption");
+                        measure_memory("Before Single Encryption")
                         
                         // Buffers for encryption/decryption
                         unsigned char padded[MAX_SIZE] = { 0 };
