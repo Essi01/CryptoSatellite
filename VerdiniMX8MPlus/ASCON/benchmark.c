@@ -804,7 +804,7 @@ void init_threads(void) {
     set_thread_affinity(crypto_thread_id, CRYPTO_THREAD_CORE);
     
     // Give threads time to initialize
-    usleep(100000);
+    usleep(10000);
 }
 
 // Cleanup threads
