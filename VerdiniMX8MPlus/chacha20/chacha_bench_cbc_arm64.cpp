@@ -449,7 +449,7 @@ void cpu_thread_fn()
         {
             std::cerr << "[DEBUG] cpu0 not found in /proc/stat\n";
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
 
