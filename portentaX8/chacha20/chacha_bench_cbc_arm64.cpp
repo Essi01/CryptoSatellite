@@ -466,7 +466,7 @@ bool join_thread_with_timeout(std::thread &t, int timeout_ms)
             t.join();
             return true;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     std::cerr << "Warning: Thread join timed out after " << timeout_ms << " ms\n";
     return false;

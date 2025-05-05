@@ -453,7 +453,7 @@ void *power_monitoring_thread(void *arg) {
         pthread_mutex_unlock(&power_mutex);
         
         // Don't sample too fast to avoid I2C bus contention
-        usleep(100000); // 100ms delay
+        usleep(10000); // 100ms delay
     }
     
     return NULL;
