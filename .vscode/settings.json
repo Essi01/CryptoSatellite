@@ -65,6 +65,7 @@
         "cinttypes": "cpp",
         "variant": "cpp",
         "codecvt": "cpp",
-        "locale": "c"
+        "locale": "c",
+        "xstring": "cpp"
     }
 }

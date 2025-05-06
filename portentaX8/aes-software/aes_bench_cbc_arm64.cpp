@@ -33,16 +33,325 @@
 #include "aes.h"
 
 // INA226 I2C address and register definitions
-#define INA226_ADDRESS 0x40
+#define INA226_ADDRESS 0x40  // Adresse bekreftet via i2cget
 #define INA226_REG_CONFIG 0x00
 #define INA226_REG_SHUNT_VOLTAGE 0x01
 #define INA226_REG_BUS_VOLTAGE 0x02
 #define INA226_REG_POWER 0x03
 #define INA226_REG_CURRENT 0x04
 #define INA226_REG_CALIBRATION 0x05
-#define INA226_SHUNT_RESISTOR 0.1f                    // 0.1 Ohm shunt resistor
-#define INA226_CURRENT_LSB 0.0001f                    // 100 uA per LSB (adjust based on calibration)
+#define INA226_SHUNT_RESISTOR 0.1f  // 0.1 Ohm shunt resistor
+#define INA226_CURRENT_LSB 0.0001f  // 100 uA per LSB (juster basert på kalibrering)
 #define INA226_POWER_LSB (25.0f * INA226_CURRENT_LSB) // Power LSB = 25 * Current LSB
+
+// Direktekommunikasjon med INA226 på I2C-buss 3
+class INA226
+{
+private:
+    int i2c_fd;
+    bool initialized;
+    const int bus_id = 3;  // Hardkodet buss 3 hvor sensoren er funnet
+
+    // Write to INA226 register
+    bool write_register(uint8_t reg, uint16_t value)
+    {
+        uint8_t buf[3];
+        buf[0] = reg;
+        buf[1] = (value >> 8) & 0xFF; // MSB
+        buf[2] = value & 0xFF;        // LSB
+
+        if (write(i2c_fd, buf, 3) != 3)
+        {
+            std::cerr << "[DEBUG] Failed to write to INA226 register 0x" << std::hex << (int)reg 
+                      << " on bus " << bus_id << ": " << strerror(errno) << "\n";
+            return false;
+        }
+        return true;
+    }
+
+    // Read from INA226 register
+    bool read_register(uint8_t reg, uint16_t &value)
+    {
+        // Write register address
+        if (write(i2c_fd, &reg, 1) != 1)
+        {
+            std::cerr << "[DEBUG] Failed to write register address 0x" << std::hex << (int)reg 
+                      << " on bus " << bus_id << ": " << strerror(errno) << "\n";
+            return false;
+        }
+        
+        // Read data (2 bytes)
+        uint8_t data[2];
+        if (read(i2c_fd, data, 2) != 2)
+        {
+            std::cerr << "[DEBUG] Failed to read from INA226 register 0x" << std::hex << (int)reg 
+                      << " on bus " << bus_id << ": " << strerror(errno) << "\n";
+            return false;
+        }
+
+        value = (data[0] << 8) | data[1];
+        return true;
+    }
+
+public:
+    INA226() : i2c_fd(-1), initialized(false)
+    {
+        char device_path[64];
+        sprintf(device_path, "/dev/i2c-%d", bus_id);
+        
+        // Open I2C device
+        i2c_fd = open(device_path, O_RDWR);
+        if (i2c_fd < 0)
+        {
+            std::cerr << "[DEBUG] Cannot open I2C device " << device_path << ": " << strerror(errno) << "\n";
+            return;
+        }
+        
+        // Set I2C slave address
+        if (ioctl(i2c_fd, I2C_SLAVE, INA226_ADDRESS) < 0)
+        {
+            std::cerr << "[DEBUG] Failed to set INA226 I2C slave address: " << strerror(errno) << "\n";
+            close(i2c_fd);
+            i2c_fd = -1;
+            return;
+        }
+
+        std::cout << "Successfully opened INA226 on I2C bus " << bus_id << " at address 0x" 
+                  << std::hex << INA226_ADDRESS << std::dec << "\n";
+
+        // Configure INA226: Continuous mode, 16 sample averaging, 1.1ms conversion time
+        uint16_t config = (0x4 << 12) | // Operating mode: Continuous shunt and bus
+                          (0x3 << 9) |  // Shunt voltage conversion time: 1.1ms
+                          (0x3 << 6) |  // Bus voltage conversion time: 1.1ms
+                          (0x3 << 3) |  // Averaging: 16 samples
+                          (0x7);        // Reserved
+        if (!write_register(INA226_REG_CONFIG, config))
+        {
+            std::cerr << "[DEBUG] Failed to configure INA226\n";
+            close(i2c_fd);
+            i2c_fd = -1;
+            return;
+        }
+
+        // Set calibration register for 0.1 ohm shunt
+        // Calibration = 0.00512 / (Current_LSB * Shunt) = 0.00512 / (0.0001 * 0.1) = 512
+        uint16_t calibration = 512;
+        if (!write_register(INA226_REG_CALIBRATION, calibration))
+        {
+            std::cerr << "[DEBUG] Failed to set INA226 calibration\n";
+            close(i2c_fd);
+            i2c_fd = -1;
+            return;
+        }
+
+        initialized = true;
+        std::cout << "[INFO] INA226 initialized successfully on bus " << bus_id << "\n";
+    }
+
+    ~INA226()
+    {
+        if (i2c_fd >= 0)
+        {
+            close(i2c_fd);
+        }
+    }
+
+    bool begin()
+    {
+        if (!initialized)
+        {
+            std::cerr << "[DEBUG] INA226 begin failed: not initialized\n";
+            return false;
+        }
+        
+        // Verify communication by reading configuration
+        uint16_t config;
+        if (!read_register(INA226_REG_CONFIG, config))
+        {
+            std::cerr << "[DEBUG] INA226 begin failed: cannot read configuration\n";
+            return false;
+        }
+        
+        std::cout << "[INFO] INA226 begin successful. Config register: 0x" << std::hex << config << std::dec << "\n";
+        return true;
+    }
+
+    bool readMeasurements(float &power_W, float &current_A, float &voltage_V)
+    {
+        if (!initialized)
+        {
+            std::cerr << "[DEBUG] readMeasurements failed: INA226 not initialized\n";
+            power_W = 0;
+            current_A = 0;
+            voltage_V = 0;
+            return false;
+        }
+
+        // Read bus voltage (1.25mV per LSB)
+        uint16_t bus_voltage_raw;
+        if (!read_register(INA226_REG_BUS_VOLTAGE, bus_voltage_raw))
+        {
+            std::cerr << "[DEBUG] Failed to read bus voltage\n";
+            return false;
+        }
+        voltage_V = bus_voltage_raw * 0.00125f; // Convert to volts
+        
+        // Read current register
+        uint16_t current_raw;
+        if (!read_register(INA226_REG_CURRENT, current_raw))
+        {
+            std::cerr << "[DEBUG] Failed to read current\n";
+            return false;
+        }
+        current_A = (int16_t)current_raw * INA226_CURRENT_LSB; // Convert to amps
+        
+        // Read power register
+        uint16_t power_raw;
+        if (!read_register(INA226_REG_POWER, power_raw))
+        {
+            std::cerr << "[DEBUG] Failed to read power\n";
+            return false;
+        }
+        power_W = power_raw * INA226_POWER_LSB; // Convert to watts
+
+        // Debugging output for first few readings
+        static int reading_count = 0;
+        if (reading_count < 5)
+        {
+            std::cout << "[DEBUG] INA226 Reading #" << reading_count 
+                      << " - Voltage: " << voltage_V << "V, Current: " << (current_A * 1000.0f) 
+                      << "mA, Power: " << (power_W * 1000.0f) << "mW\n";
+            reading_count++;
+        }
+
+        return true;
+    }
+};
+
+// Create global INA226 instance
+INA226 ina;
+
+std::atomic<bool> sampling{false};
+std::atomic<bool> cpu_sampling{false};
+std::vector<float> power_samples, current_samples, voltage_samples;
+std::vector<float> cpu_usage_samples;
+std::mutex samples_mtx;
+
+void pin_to_core(int core_id)
+{
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    CPU_SET(core_id, &cpus);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus) != 0)
+    {
+        std::cerr << "Failed to pin thread to core " << core_id << ": " << strerror(errno) << "\n";
+    }
+}
+
+void power_thread_fn()
+{
+    pin_to_core(1);
+    std::cout << "[INFO] Power sampling thread started\n";
+    int sample_count = 0;
+    
+    while (sampling.load())
+    {
+        float power_W = 0.0f, current_A = 0.0f, voltage_V = 0.0f;
+        bool valid_reading = ina.readMeasurements(power_W, current_A, voltage_V);
+        
+        if (valid_reading)
+        {
+            std::lock_guard<std::mutex> lk(samples_mtx);
+            power_samples.push_back(power_W);
+            current_samples.push_back(current_A);
+            voltage_samples.push_back(voltage_V);
+            sample_count++;
+            
+            if (sample_count % 100 == 0)
+            {
+                std::cout << "[INFO] Collected " << sample_count << " power samples\n";
+            }
+        }
+        else
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        // Ikke samle for raskt for å unngå å overbelaste I2C-bussen
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::cout << "[INFO] Power sampling thread stopped, collected " << sample_count << " samples\n";
+}
+
+void cpu_thread_fn()
+{
+    pin_to_core(2);
+    std::ifstream proc_stat("/proc/stat");
+    if (!proc_stat.is_open())
+    {
+        std::cerr << "[DEBUG] Failed to open /proc/stat: " << strerror(errno) << "\n";
+        return;
+    }
+
+    uint64_t prev_total = 0, prev_idle = 0;
+    while (cpu_sampling.load())
+    {
+        proc_stat.clear();
+        proc_stat.seekg(0);
+        std::string line;
+        bool found_cpu0 = false;
+        while (std::getline(proc_stat, line))
+        {
+            if (line.find("cpu0") == 0)
+            {
+                found_cpu0 = true;
+                std::istringstream iss(line);
+                std::string cpu;
+                uint64_t user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice;
+                iss >> cpu >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal >> guest >> guest_nice;
+                uint64_t total = user + nice + system + idle + iowait + irq + softirq + steal + guest + guest_nice;
+                uint64_t idle_time = idle + iowait;
+
+                if (prev_total != 0)
+                {
+                    uint64_t delta_total = total - prev_total;
+                    uint64_t delta_idle = idle_time - prev_idle;
+                    float usage = delta_total ? 100.0f * (delta_total - delta_idle) / delta_total : 0.0f;
+                    {
+                        std::lock_guard<std::mutex> lk(samples_mtx);
+                        cpu_usage_samples.push_back(usage);
+                    }
+                }
+                prev_total = total;
+                prev_idle = idle_time;
+                break;
+            }
+        }
+        if (!found_cpu0)
+        {
+            std::cerr << "[DEBUG] cpu0 not found in /proc/stat\n";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+bool join_thread_with_timeout(std::thread &t, int timeout_ms)
+{
+    auto start = std::chrono::steady_clock::now();
+    while (std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start)
+               .count() < timeout_ms)
+    {
+        if (t.joinable())
+        {
+            t.join();
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    std::cerr << "Warning: Thread join timed out after " << timeout_ms << " ms\n";
+    return false;
+}
 
 void verify_decryption(const std::vector<uint8_t> &pt, const std::vector<uint8_t> &dt, size_t data_len, bool is_image, const std::string &output_image_path = "")
 {
@@ -197,324 +506,6 @@ double eval_expr(const std::string &expr)
     return values.top();
 }
 
-class INA226
-{
-    int i2c_fd;
-    bool initialized;
-
-    // Write to INA226 register
-    bool write_register(uint8_t reg, uint16_t value)
-    {
-        struct i2c_msg messages[1];
-        struct i2c_rdwr_ioctl_data packets;
-        uint8_t buf[3];
-
-        buf[0] = reg;
-        buf[1] = (value >> 8) & 0xFF; // MSB
-        buf[2] = value & 0xFF;        // LSB
-
-        messages[0].addr = INA226_ADDRESS;
-        messages[0].flags = 0; // Write
-        messages[0].len = 3;
-        messages[0].buf = buf;
-
-        packets.msgs = messages;
-        packets.nmsgs = 1;
-
-        if (ioctl(i2c_fd, I2C_RDWR, &packets) < 0)
-        {
-            std::cerr << "[DEBUG] Failed to write to INA226 register 0x" << std::hex << (int)reg << ": " << strerror(errno) << "\n";
-            return false;
-        }
-        return true;
-    }
-
-    // Read from INA226 register
-    bool read_register(uint8_t reg, uint16_t &value)
-    {
-        struct i2c_msg messages[2];
-        struct i2c_rdwr_ioctl_data packets;
-        uint8_t reg_buf[1] = {reg};
-        uint8_t data[2];
-
-        // Write register address
-        messages[0].addr = INA226_ADDRESS;
-        messages[0].flags = 0; // Write
-        messages[0].len = 1;
-        messages[0].buf = reg_buf;
-
-        // Read data
-        messages[1].addr = INA226_ADDRESS;
-        messages[1].flags = I2C_M_RD; // Read
-        messages[1].len = 2;
-        messages[1].buf = data;
-
-        packets.msgs = messages;
-        packets.nmsgs = 2;
-
-        if (ioctl(i2c_fd, I2C_RDWR, &packets) < 0)
-        {
-            std::cerr << "[DEBUG] Failed to read from INA226 register 0x" << std::hex << (int)reg << ": " << strerror(errno) << "\n";
-            return false;
-        }
-
-        value = (data[0] << 8) | data[1];
-        return true;
-    }
-
-public:
-    INA226(const char *i2c_device = "/dev/i2c-1") : i2c_fd(-1), initialized(false)
-    {
-        // Open I2C device
-        i2c_fd = open(i2c_device, O_RDWR);
-        if (i2c_fd < 0)
-        {
-            std::cerr << "[DEBUG] Cannot open I2C device " << i2c_device << ": " << strerror(errno) << "\n";
-            return;
-        }
-
-        // Configure INA226: Continuous mode, 1 sample averaging, 1.1ms conversion time
-        uint16_t config = (0x4 << 13) | // Operating mode: Continuous shunt and bus
-                          (0x4 << 9) |  // Shunt voltage conversion time: 1.1ms
-                          (0x4 << 6) |  // Bus voltage conversion time: 1.1ms
-                          (0x0 << 3) |  // Averaging: 1 sample
-                          (0x7);        // Reserved
-        if (!write_register(INA226_REG_CONFIG, config))
-        {
-            std::cerr << "[DEBUG] Failed to configure INA226\n";
-            close(i2c_fd);
-            i2c_fd = -1;
-            return;
-        }
-
-        // Set calibration register
-        // Current_LSB = 100uA, Max current = 0.8A, Shunt = 0.1 Ohm
-        // Calibration = 0.00512 / (Current_LSB * Shunt) = 0.00512 / (0.0001 * 0.1) = 512
-        uint16_t calibration = 512;
-        if (!write_register(INA226_REG_CALIBRATION, calibration))
-        {
-            std::cerr << "[DEBUG] Failed to set INA226 calibration\n";
-            close(i2c_fd);
-            i2c_fd = -1;
-            return;
-        }
-
-        initialized = true;
-        std::cerr << "[DEBUG] INA226 initialized successfully\n";
-    }
-
-    ~INA226()
-    {
-        if (i2c_fd >= 0)
-        {
-            close(i2c_fd);
-        }
-    }
-
-    bool begin()
-    {
-        if (!initialized)
-        {
-            std::cerr << "[DEBUG] INA226 begin failed: not initialized\n";
-            return false;
-        }
-        // Verify communication by reading configuration
-        uint16_t config;
-        if (!read_register(INA226_REG_CONFIG, config))
-        {
-            std::cerr << "[DEBUG] INA226 begin failed: cannot read configuration\n";
-            return false;
-        }
-        std::cerr << "[DEBUG] INA226 begin successful\n";
-        return true;
-    }
-
-    bool readMeasurements(float &power_W, float &current_A, float &voltage_V)
-    {
-        if (!initialized)
-        {
-            std::cerr << "[DEBUG] readMeasurements failed: INA226 not initialized\n";
-            power_W = 0;
-            current_A = 0;
-            voltage_V = 0;
-            return false;
-        }
-
-        // Read bus voltage (1.25mV per LSB)
-        uint16_t bus_voltage_raw;
-        if (!read_register(INA226_REG_BUS_VOLTAGE, bus_voltage_raw))
-        {
-            std::cerr << "[DEBUG] Failed to read bus voltage\n";
-            power_W = 0;
-            current_A = 0;
-            voltage_V = 0;
-            return false;
-        }
-        voltage_V = bus_voltage_raw * 0.00125f; // Convert to volts
-        if (voltage_V < 0 || voltage_V > 36)
-        {
-            std::cerr << "[DEBUG] Invalid voltage reading: " << voltage_V << " V\n";
-            power_W = 0;
-            current_A = 0;
-            voltage_V = 0;
-            return false;
-        }
-
-        // Read current (100uA per LSB)
-        uint16_t current_raw;
-        if (!read_register(INA226_REG_CURRENT, current_raw))
-        {
-            std::cerr << "[DEBUG] Failed to read current\n";
-            power_W = 0;
-            current_A = 0;
-            voltage_V = 0;
-            return false;
-        }
-        current_A = (int16_t)current_raw * INA226_CURRENT_LSB; // Convert to amps
-        if (current_A < -0.8f || current_A > 0.8f)
-        {
-            std::cerr << "[DEBUG] Invalid current reading: " << current_A << " A\n";
-            power_W = 0;
-            current_A = 0;
-            voltage_V = 0;
-            return false;
-        }
-
-        // Read power (Power_LSB = 25 * Current_LSB)
-        uint16_t power_raw;
-        if (!read_register(INA226_REG_POWER, power_raw))
-        {
-            std::cerr << "[DEBUG] Failed to read power\n";
-            power_W = 0;
-            current_A = 0;
-            voltage_V = 0;
-            return false;
-        }
-        power_W = power_raw * INA226_POWER_LSB; // Convert to watts
-        if (power_W < 0 || power_W > 10)
-        {
-            std::cerr << "[DEBUG] Invalid power reading: " << power_W << " W\n";
-            power_W = 0;
-            current_A = 0;
-            voltage_V = 0;
-            return false;
-        }
-
-        return true;
-    }
-};
-
-INA226 ina("/dev/i2c-3");
-
-std::atomic<bool> sampling{false};
-std::atomic<bool> cpu_sampling{false};
-std::vector<float> power_samples, current_samples, voltage_samples;
-std::vector<float> cpu_usage_samples;
-std::mutex samples_mtx;
-
-void pin_to_core(int core_id)
-{
-    cpu_set_t cpus;
-    CPU_ZERO(&cpus);
-    CPU_SET(core_id, &cpus);
-    if (pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus) != 0)
-    {
-        std::cerr << "Failed to pin thread to core " << core_id << ": " << strerror(errno) << "\n";
-    }
-}
-
-void power_thread_fn()
-{
-    pin_to_core(1);
-    while (sampling.load())
-    {
-        float power_W, current_A, voltage_V;
-        if (ina.readMeasurements(power_W, current_A, voltage_V))
-        {
-            std::lock_guard<std::mutex> lk(samples_mtx);
-            power_samples.push_back(power_W);
-            current_samples.push_back(current_A);
-            voltage_samples.push_back(voltage_V);
-        }
-        else
-        {
-            std::this_thread::sleep_for(std::chrono::microseconds(1200));
-            continue;
-        }
-        std::this_thread::sleep_for(std::chrono::microseconds(1200));
-    }
-}
-
-void cpu_thread_fn()
-{
-    pin_to_core(2);
-    std::ifstream proc_stat("/proc/stat");
-    if (!proc_stat.is_open())
-    {
-        std::cerr << "[DEBUG] Failed to open /proc/stat: " << strerror(errno) << "\n";
-        return;
-    }
-
-    uint64_t prev_total = 0, prev_idle = 0;
-    while (cpu_sampling.load())
-    {
-        proc_stat.clear();
-        proc_stat.seekg(0);
-        std::string line;
-        bool found_cpu0 = false;
-        while (std::getline(proc_stat, line))
-        {
-            if (line.find("cpu0") == 0)
-            {
-                found_cpu0 = true;
-                std::istringstream iss(line);
-                std::string cpu;
-                uint64_t user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice;
-                iss >> cpu >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal >> guest >> guest_nice;
-                uint64_t total = user + nice + system + idle + iowait + irq + softirq + steal + guest + guest_nice;
-                uint64_t idle_time = idle + iowait;
-
-                if (prev_total != 0)
-                {
-                    uint64_t delta_total = total - prev_total;
-                    uint64_t delta_idle = idle_time - prev_idle;
-                    float usage = delta_total ? 100.0f * (delta_total - delta_idle) / delta_total : 0.0f;
-                    {
-                        std::lock_guard<std::mutex> lk(samples_mtx);
-                        cpu_usage_samples.push_back(usage);
-                    }
-                }
-                prev_total = total;
-                prev_idle = idle_time;
-                break;
-            }
-        }
-        if (!found_cpu0)
-        {
-            std::cerr << "[DEBUG] cpu0 not found in /proc/stat\n";
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-}
-
-bool join_thread_with_timeout(std::thread &t, int timeout_ms)
-{
-    auto start = std::chrono::steady_clock::now();
-    while (std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now() - start)
-               .count() < timeout_ms)
-    {
-        if (t.joinable())
-        {
-            t.join();
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    std::cerr << "Warning: Thread join timed out after " << timeout_ms << " ms\n";
-    return false;
-}
-
 std::vector<uint8_t> read_file(const std::string &filename, size_t &data_len)
 {
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
@@ -539,15 +530,66 @@ bool file_exists(const std::string &filename)
 
 int main(int argc, char *argv[])
 {
-    if (argc != 3)
-    {
-        std::cerr << "Usage: " << argv[0] << " <iterations> <input>\n";
-        std::cerr << "  - <iterations>: Number of encryption/decryption iterations\n";
-        std::cerr << "  - <input>: Plaintext string or path to an image file\n";
-        std::cerr << "Examples:\n";
-        std::cerr << "  " << argv[0] << " 50 \"(10 + 5) * 2 =?\"\n";
-        std::cerr << "  " << argv[0] << " 50 image.jpg\n";
-        return 1;
+    if (argc == 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+        std::cout << "Usage: " << argv[0] << " <iterations> <input>\n";
+        std::cout << "  - <iterations>: Number of encryption/decryption iterations\n";
+        std::cout << "  - <input>: Plaintext string or path to an image file\n";
+        std::cout << "Examples:\n";
+        std::cout << "  " << argv[0] << " 5000 \"SAT-TEST-1234: Secure Transmission OK\"\n";
+        std::cout << "  " << argv[0] << " 5000 \"(10 + 5) * 2 =?\"\n";
+        std::cout << "  " << argv[0] << " 500 image.jpg\n\n";
+        std::cout << "Note: For I2C access, you may need to run with sudo\n";
+        return 0;
+    }
+
+    if (argc < 3) {
+        if (argc > 1 && std::string(argv[1]) == "REPEAT" && argc >= 4) {
+            // Special handling for REPEAT command format
+            try {
+                int iterations = std::stoi(argv[2]);
+                std::string input_text = argv[3];
+                for (int i = 4; i < argc; i++) {
+                    input_text += " ";
+                    input_text += argv[i];
+                }
+                
+                // Reassign arguments for standard processing
+                char** new_argv = new char*[3];
+                new_argv[0] = argv[0];
+                new_argv[1] = argv[2]; // iterations
+                new_argv[2] = strdup(input_text.c_str());
+                argv = new_argv;
+                
+                std::cout << "Running with REPEAT command: iterations=" << iterations 
+                          << ", text=\"" << input_text << "\"\n";
+            } catch (const std::exception& e) {
+                std::cerr << "Error parsing REPEAT command: " << e.what() << "\n";
+                return 1;
+            }
+        } else if (argc > 1 && std::string(argv[1]) == "IMAGE" && argc >= 4) {
+            // Special handling for IMAGE command format
+            try {
+                int iterations = std::stoi(argv[2]);
+                std::string filename = argv[3];
+                
+                // Reassign arguments for standard processing
+                char** new_argv = new char*[3];
+                new_argv[0] = argv[0];
+                new_argv[1] = argv[2]; // iterations
+                new_argv[2] = strdup(filename.c_str());
+                argv = new_argv;
+                
+                std::cout << "Running with IMAGE command: iterations=" << iterations 
+                          << ", file=\"" << filename << "\"\n";
+            } catch (const std::exception& e) {
+                std::cerr << "Error parsing IMAGE command: " << e.what() << "\n";
+                return 1;
+            }
+        } else {
+            std::cerr << "Usage: " << argv[0] << " <iterations> <input>\n";
+            std::cerr << "Try '" << argv[0] << " --help' for more information.\n";
+            return 1;
+        }
     }
 
     size_t iterations;
@@ -567,10 +609,18 @@ int main(int argc, char *argv[])
 
     pin_to_core(0);
 
+    std::cout << "\n==========================================\n"
+              << "         BENCHMARK STARTED\n"
+              << "==========================================\n";
+    std::cout << "Starting AES-CBC benchmark with " << iterations << " repetitions...\n";
+    std::cout << "Input: \"" << (is_image ? image_path : input_arg) << "\" (" 
+              << (is_image ? "image file" : std::to_string(input_arg.size()) + " bytes") << ")\n";
+
     bool power_sampling_enabled = ina.begin();
     if (!power_sampling_enabled)
     {
-        std::cerr << "Warning: Power and current sampling disabled due to INA226 failure\n";
+        std::cerr << "\nWarning: Power and current sampling disabled due to INA226 failure\n";
+        std::cerr << "Running on Portenta X8 requires I2C permissions: try 'sudo " << argv[0] << " ...'\n";
     }
 
     const size_t BLOCK_SIZE = AES_BLOCKLEN, KEY_SIZE = AES_KEYLEN;
@@ -628,7 +678,7 @@ int main(int argc, char *argv[])
     {
         struct AES_ctx ctx;
         AES_init_ctx_iv(&ctx, key, iv);
-        memcpy(ct.data(), pt.data(), pad_len);
+        std::copy(pt.begin(), pt.end(), ct.begin());
         AES_CBC_encrypt_buffer(&ctx, ct.data(), pad_len);
     }
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -637,7 +687,7 @@ int main(int argc, char *argv[])
     {
         struct AES_ctx ctx;
         AES_init_ctx_iv(&ctx, key, iv);
-        memcpy(dt.data(), ct.data(), pad_len);
+        std::copy(ct.begin(), ct.end(), dt.begin());
         AES_CBC_decrypt_buffer(&ctx, dt.data(), pad_len);
     }
     auto t3 = std::chrono::high_resolution_clock::now();
@@ -747,23 +797,44 @@ int main(int argc, char *argv[])
         }
     }
 
-    std::cout << "---------------------\n"
-              << "Iterations=" << iterations << "\n"
-              << "Enc=" << enc_us << " us\n"
-              << "Dec=" << dec_us << " us\n"
-              << "LatencyEnc=" << latency_e << " us\n"
-              << "LatencyDec=" << latency_d << " us\n"
-              << "ThroughputEnc=" << tp_e << " B/s\n"
-              << "ThroughputDec=" << tp_d << " B/s\n"
-              << "PeakRAM=" << ram << " bytes\n"
-              << "ProgramSize=" << program_size << " bytes (run 'aarch64-linux-gnu-size aes_bench_cbc_arm64' for accurate ROM usage)\n\n"
-              << "AvgPower=" << avg_p << " W\n"
-              << "PowerSamples=" << sample_count << "\n"
-              << "AvgCurrent=" << (avg_curr_A * 1000) << " mA\n"
-              << "AvgVoltage=" << avg_volt_V << " V\n"
-              << "AvgCPUUsage=" << avg_cpu << " %\n"
-              << "Energy=" << e_J << " J\n"
-              << "---------------------\n";
+    std::cout << "\n==========================================\n"
+              << "         POWER MEASUREMENTS\n"
+              << "==========================================\n";
+    std::cout << "Average current: " << (avg_curr_A * 1e6) << " μA (" << avg_curr_A << " A)\n";
+    std::cout << "Bus voltage: " << avg_volt_V << " V\n";
+    std::cout << "Average power: " << (avg_p * 1000) << " mW (" << avg_p << " W)\n";
+    std::cout << "Energy consumption: " << (e_J * 1000) << " mJ (" << e_J << " J)\n";
+    std::cout << "Energy in watt-hours: " << (e_J / 3600) << " Wh\n";
+    std::cout << "Energy per operation: " << (e_J / iterations * 1000) << " mJ/op\n";
+    std::cout << "Energy per byte: " << (e_J / (iterations * data_len) * 1e6) << " μJ/byte\n";
+
+    std::cout << "\n==========================================\n"
+              << "         BENCHMARK RESULTS\n"
+              << "==========================================\n";
+    std::cout << "Input " << (is_image ? "image" : "text") << ": \"" 
+              << (is_image ? image_path : input_arg) << "\" (" 
+              << data_len << " bytes, padded to " << pad_len << " bytes)\n";
+    std::cout << "Total encryption time: " << enc_us << " µs\n";
+    std::cout << "Total decryption time: " << dec_us << " µs\n";
+    std::cout << "Total combined time: " << (enc_us + dec_us) << " µs\n";
+    std::cout << "Total benchmark time: " << (enc_us + dec_us) / 1000 << " ms\n";
+    std::cout << "CPU usage: " << avg_cpu << "%\n\n";
+
+    std::cout << "Average time per operation:\n";
+    std::cout << "  Encryption: " << latency_e << " µs\n";
+    std::cout << "  Decryption: " << latency_d << " µs\n";
+    std::cout << "  Combined average: " << (latency_e + latency_d) / 2 << " µs\n\n";
+
+    std::cout << "Performance metrics:\n";
+    std::cout << "Encryption throughput: " << tp_e << " bytes/s\n";
+    std::cout << "Decryption throughput: " << tp_d << " bytes/s\n";
+    std::cout << "Encryption goodput: " << (tp_e * data_len / pad_len) << " bytes/s\n";
+    std::cout << "Decryption goodput: " << (tp_d * data_len / pad_len) << " bytes/s\n";
+    std::cout << "Protocol overhead: " << (100.0 * (pad_len - data_len) / pad_len) << "%\n\n";
+
+    std::cout << "Resource usage:\n";
+    std::cout << "Peak RAM: " << ram << " bytes\n";
+    std::cout << "Program size: " << program_size << " bytes\n";
 
     return 0;
 }

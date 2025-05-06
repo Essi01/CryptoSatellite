@@ -618,7 +618,6 @@ void processImageFile(const char *filename, int iterations = 1) {
     std::cout << "Power: " << (avg_p * 1000.0) << " mW (" << avg_p << " W)\n";
     std::cout << "Energy consumption: " << (energy_j * 1000.0) << " mJ (" << energy_j << " J)\n";
     std::cout << "Energy per byte: " << ((energy_j * 1000000.0) / (filesize * iterations)) << " μJ/byte\n";
-    std::cout << "CPU usage: " << avg_cpu << " %\n";
     std::cout << "\nOutput files:\n";
     std::cout << "Encrypted file saved as: encrypted.bin\n";
     std::cout << "Decrypted file saved as: " << decrypted_filename << "\n";
