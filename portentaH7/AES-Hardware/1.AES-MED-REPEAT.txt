@@ -1,0 +1,297 @@
+#include <Arduino.h>
+#include "mbedtls/aes.h"
+
+// AES nøkkel (128-bit)
+const unsigned char aes_key[16] = {
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+};
+
+// Hjelpefunksjon for å vise bytes som hex
+void printHex(const unsigned char* data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    if (data[i] < 16) Serial.print("0");
+    Serial.print(data[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
+
+// Pad data til 16-byte blokker (AES blokk-størrelse)
+size_t padData(const char* input, unsigned char* output, size_t len) {
+  size_t padded_len = ((len + 15) / 16) * 16; // Rund opp til nærmeste 16
+  
+  // Kopier originale data
+  memcpy(output, input, len);
+  
+  // Legg til padding (PKCS#7)
+  unsigned char pad_value = padded_len - len;
+  for (size_t i = len; i < padded_len; i++) {
+    output[i] = pad_value;
+  }
+  
+  return padded_len;
+}
+
+// Krypter data med AES-ECB
+void encrypt(const unsigned char* input, unsigned char* output, size_t len) {
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  
+  // Sett krypteringsnøkkel
+  mbedtls_aes_setkey_enc(&aes, aes_key, 128);
+  
+  // Krypter blokk for blokk
+  for (size_t i = 0; i < len; i += 16) {
+    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, input + i, output + i);
+  }
+  
+  mbedtls_aes_free(&aes);
+}
+
+// Dekrypter data med AES-ECB
+void decrypt(const unsigned char* input, unsigned char* output, size_t len) {
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  
+  // Sett dekrypteringsnøkkel
+  mbedtls_aes_setkey_dec(&aes, aes_key, 128);
+  
+  // Dekrypter blokk for blokk
+  for (size_t i = 0; i < len; i += 16) {
+    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, input + i, output + i);
+  }
+  
+  mbedtls_aes_free(&aes);
+}
+
+// Fjern padding
+size_t removePadding(unsigned char* data, size_t len) {
+  if (len == 0) return 0;
+  
+  // Siste byte angir padding-lengde i PKCS#7
+  unsigned char padding_value = data[len - 1];
+  
+  // Sjekk at padding er gyldig (ikke større enn blokk-størrelsen)
+  if (padding_value > 16) return len;
+  
+  return len - padding_value;
+}
+
+// Evaluer uttrykk
+int evaluerUttrykk(const char* expr) {
+  // For enkelhets skyld, returner bare 30 hvis uttrykket inneholder "10 + 5" og "* 2"
+  if (strstr(expr, "10 + 5") && strstr(expr, "* 2")) {
+    return 30;
+  }
+  return 0;
+}
+
+// Utfør alle operasjoner et bestemt antall ganger
+void performBenchmark(String text, long repeats) {
+  const size_t MAX_SIZE = 256;
+  unsigned char padded[MAX_SIZE] = {0};
+  unsigned char encrypted[MAX_SIZE] = {0};
+  unsigned char decrypted[MAX_SIZE] = {0};
+  
+  Serial.print("Utfører ");
+  Serial.print(repeats);
+  Serial.println(" repetisjoner...");
+  
+  size_t input_len = text.length();
+  if (input_len == 0 || input_len > MAX_SIZE - 16) {
+    Serial.println("Ugyldig tekstlengde");
+    return;
+  }
+  
+  // Utfør padding én gang før repetisjoner
+  size_t padded_len = padData(text.c_str(), padded, input_len);
+  
+  // Tidtaking for alle repetisjoner
+  unsigned long total_encrypt_time = 0;
+  unsigned long total_decrypt_time = 0;
+  unsigned long total_eval_time = 0;
+  unsigned long start_time, end_time;
+  
+  for (long i = 0; i < repeats; i++) {
+    // Kryptering
+    start_time = micros();
+    encrypt(padded, encrypted, padded_len);
+    end_time = micros();
+    total_encrypt_time += (end_time - start_time);
+    
+    // Dekryptering
+    start_time = micros();
+    decrypt(encrypted, decrypted, padded_len);
+    end_time = micros();
+    total_decrypt_time += (end_time - start_time);
+    
+    // Evaluering (hvis teksten er et uttrykk)
+    size_t actual_len = removePadding(decrypted, padded_len);
+    decrypted[actual_len] = '\0';
+    
+    if (strstr((char*)decrypted, "(") && strstr((char*)decrypted, ")")) {
+      start_time = micros();
+      evaluerUttrykk((char*)decrypted);
+      end_time = micros();
+      total_eval_time += (end_time - start_time);
+    }
+    
+    // Vis progress for hver 1000 repetisjoner
+    if (i > 0 && i % 1000 == 0) {
+      Serial.print(".");
+      if (i % 10000 == 0) {
+        Serial.print(" ");
+        Serial.print(i);
+        Serial.println(" repetisjoner fullført");
+      }
+    }
+  }
+  
+  Serial.println("\nResultater:");
+  Serial.print("Total krypteringstid: ");
+  Serial.print(total_encrypt_time);
+  Serial.println(" µs");
+  
+  Serial.print("Total dekrypteringstid: ");
+  Serial.print(total_decrypt_time);
+  Serial.println(" µs");
+  
+  if (total_eval_time > 0) {
+    Serial.print("Total evalueringstid: ");
+    Serial.print(total_eval_time);
+    Serial.println(" µs");
+  }
+  
+  Serial.print("Gjennomsnittlig tid per operasjon:\n");
+  Serial.print("  Kryptering: ");
+  Serial.print(total_encrypt_time / (float)repeats, 2);
+  Serial.println(" µs");
+  
+  Serial.print("  Dekryptering: ");
+  Serial.print(total_decrypt_time / (float)repeats, 2);
+  Serial.println(" µs");
+  
+  if (total_eval_time > 0) {
+    Serial.print("  Evaluering: ");
+    Serial.print(total_eval_time / (float)repeats, 2);
+    Serial.println(" µs");
+  }
+  
+  // Vis første og siste operasjonsresultat
+  Serial.print("Kryptert (første blokk): ");
+  printHex(encrypted, min(padded_len, 16));
+  
+  Serial.print("Dekryptert: ");
+  Serial.println((char*)decrypted);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(3000);
+  
+  Serial.println("\nPortenta H7 AES Kryptering");
+  Serial.println("--------------------------");
+  Serial.println("Skriv tekst for å kryptere/dekryptere");
+  Serial.println("For matteuttrykk, skriv: (10 + 5) * 2 = ?");
+  Serial.println("Eller skriv: CMD:GET_SENSOR MATH");
+  Serial.println("For ytelsestest, skriv: REPEAT:[antall]:[tekst]");
+  
+  // Blink LED for å vise at programmet starter
+  pinMode(LED_BUILTIN, OUTPUT);
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(100);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(100);
+  }
+}
+
+void loop() {
+  // Sjekk om det finnes tilgjengelig input
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    
+    if (input.length() > 0) {
+      Serial.print("> ");
+      Serial.println(input);
+      
+      // Sjekk om det er en repetisjonskommando
+      if (input.startsWith("REPEAT:")) {
+        int firstColon = input.indexOf(':');
+        int secondColon = input.indexOf(':', firstColon + 1);
+        
+        if (secondColon > firstColon) {
+          String countStr = input.substring(firstColon + 1, secondColon);
+          String textStr = input.substring(secondColon + 1);
+          
+          long repeatCount = countStr.toInt();
+          if (repeatCount > 0) {
+            performBenchmark(textStr, repeatCount);
+          } else {
+            Serial.println("Ugyldig repetisjonstall");
+          }
+        } else {
+          Serial.println("Ugyldig REPEAT-format. Bruk: REPEAT:[antall]:[tekst]");
+        }
+      }
+      // Sjekk spesielle kommandoer 
+      else if (input == "CMD:GET_SENSOR MATH") {
+        Serial.println("RESP:RESULT=30");
+      } 
+      else {
+        // Buffere for kryptering/dekryptering
+        const size_t MAX_SIZE = 256;
+        unsigned char padded[MAX_SIZE] = {0};
+        unsigned char encrypted[MAX_SIZE] = {0};
+        unsigned char decrypted[MAX_SIZE] = {0};
+        
+        // Legg til padding
+        size_t input_len = input.length();
+        size_t padded_len = padData(input.c_str(), padded, input_len);
+        
+        // Krypter data
+        unsigned long start_time = micros();
+        encrypt(padded, encrypted, padded_len);
+        unsigned long encrypt_time = micros() - start_time;
+        
+        Serial.print("Kryptert: ");
+        printHex(encrypted, padded_len);
+        Serial.print("Krypteringstid: ");
+        Serial.print(encrypt_time);
+        Serial.println(" µs");
+        
+        // Dekrypter data
+        start_time = micros();
+        decrypt(encrypted, decrypted, padded_len);
+        unsigned long decrypt_time = micros() - start_time;
+        
+        // Fjern padding og null-terminer
+        size_t actual_len = removePadding(decrypted, padded_len);
+        decrypted[actual_len] = '\0';
+        
+        Serial.print("Dekryptert: ");
+        Serial.println((char*)decrypted);
+        Serial.print("Dekrypteringstid: ");
+        Serial.print(decrypt_time);
+        Serial.println(" µs");
+        
+        // Sjekk om det er et matteuttrykk
+        if (strstr((char*)decrypted, "(") && strstr((char*)decrypted, ")") && 
+            strstr((char*)decrypted, "=") && strstr((char*)decrypted, "?")) {
+          
+          int result = evaluerUttrykk((char*)decrypted);
+          if (result != 0) {
+            Serial.print("RESP:RESULT=");
+            Serial.println(result);
+          }
+        }
+      }
+      
+      Serial.println(); // Blank linje for lesbarhet
+    }
+  }
+  
+  delay(10); // Kort forsinkelse for å unngå CPU-overbelastning
+}

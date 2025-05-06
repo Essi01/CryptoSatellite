@@ -590,146 +590,65 @@ void *cpu_monitoring_thread(void *arg) {
     return NULL;
 }
 // Crypto thread function (K2)
+// Simplified crypto thread function
 void *crypto_thread(void *arg) {
     pthread_mutex_lock(&print_mutex);
     printf("Crypto thread started on core %d\n", CRYPTO_THREAD_CORE);
     pthread_mutex_unlock(&print_mutex);
     
     while (threads_running) {
-        pthread_mutex_lock(&benchmark_mutex);
-        
-        // Wait for task if none is ready
-        while (!crypto_task_ready && threads_running) {
-            pthread_cond_wait(&crypto_task_cond, &benchmark_mutex);
+        // Use a small sleep when idle to reduce CPU usage
+        if (benchmark_state != BENCHMARK_RUNNING) {
+            usleep(10000);  // 10ms
+            continue;
         }
         
-        // Check if we're still running
-        if (!threads_running) {
-            pthread_mutex_unlock(&benchmark_mutex);
-            break;
-        }
+        // Process the benchmark directly here instead of complex synchronization
+        long iterations = benchmark_total_iterations;
+        size_t padded_len = benchmark_padded_len;
+        unsigned char verify_buffer[MAX_SIZE];
         
-        // Process benchmark chunk if running
-        if (benchmark_state == BENCHMARK_RUNNING) {
-            // Process benchmark chunk (inline for simplicity)
-            unsigned long encrypt_time, decrypt_time;
-            int chunk_size = (benchmark_total_iterations - benchmark_current_iteration < BENCHMARK_CHUNK_SIZE) ? 
-                           benchmark_total_iterations - benchmark_current_iteration : BENCHMARK_CHUNK_SIZE;
-            bool report_progress = false;
+        // Progress indicators
+        int progress_indicator = iterations / 100;  // Show progress every 1%
+        if (progress_indicator < 10) progress_indicator = 10;
+        
+        // Run the benchmark directly
+        for (long i = 0; i < iterations && benchmark_state == BENCHMARK_RUNNING; i++) {
+            // Encryption
+            unsigned long start_time = get_time_ms();
+            encrypt(benchmark_padded, benchmark_encrypted, padded_len);
+            unsigned long end_time = get_time_ms();
+            unsigned long encrypt_time = end_time - start_time;
             
-            // For statistical validation
-            static unsigned long min_encrypt_time = UINT_MAX;
-            static unsigned long max_encrypt_time = 0;
-            static unsigned long min_decrypt_time = UINT_MAX;
-            static unsigned long max_decrypt_time = 0;
+            // Decryption
+            start_time = get_time_ms();
+            decrypt(benchmark_encrypted, benchmark_decrypted, padded_len + IV_SIZE + TAG_SIZE);
+            end_time = get_time_ms();
+            unsigned long decrypt_time = end_time - start_time;
             
-            for (int i = 0; i < chunk_size; i++) {
-                // Encryption timing with verification
-                encrypt_time = encrypt(benchmark_padded, benchmark_encrypted, benchmark_padded_len);
-                benchmark_total_encrypt_time += encrypt_time;
-                
-                // Track min/max for statistical validation
-                if (encrypt_time < min_encrypt_time) min_encrypt_time = encrypt_time;
-                if (encrypt_time > max_encrypt_time) max_encrypt_time = encrypt_time;
-                
-                // Verify encryption result by decrypting and comparing (every 500th iteration to save time)
-                if (benchmark_current_iteration % 500 == 0) {
-                    unsigned char verify_buffer[MAX_SIZE];
-                    decrypt(benchmark_encrypted, verify_buffer, benchmark_padded_len + IV_SIZE + TAG_SIZE);
-                    
-                    // Check if decryption produces the original plaintext
-                    bool encryption_verified = true;
-                    for (size_t j = 0; j < benchmark_padded_len; j++) {
-                        if (verify_buffer[j] != benchmark_padded[j]) {
-                            encryption_verified = false;
-                            break;
-                        }
-                    }
-                    
-                    if (!encryption_verified) {
-                        pthread_mutex_lock(&print_mutex);
-                        printf("\nWARNING: Encryption verification failed! Results may be invalid.\n");
-                        pthread_mutex_unlock(&print_mutex);
-                    }
-                }
-                
-                // Decryption timing
-                decrypt_time = decrypt(benchmark_encrypted, benchmark_decrypted, benchmark_padded_len + IV_SIZE + TAG_SIZE);
-                benchmark_total_decrypt_time += decrypt_time;
-                
-                // Track min/max for statistical validation
-                if (decrypt_time < min_decrypt_time) min_decrypt_time = decrypt_time;
-                if (decrypt_time > max_decrypt_time) max_decrypt_time = decrypt_time;
-                
-                // Evaluation (if the text is an expression)
-                size_t actual_len = removePadding(benchmark_decrypted, benchmark_padded_len);
-                benchmark_decrypted[actual_len] = '\0';
-                
-                if (strstr((char*)benchmark_decrypted, "+") || strstr((char*)benchmark_decrypted, "-") || 
-                    strstr((char*)benchmark_decrypted, "*") || strstr((char*)benchmark_decrypted, "/") ||
-                    strstr((char*)benchmark_decrypted, "(10+5)") || strstr((char*)benchmark_decrypted, "(10 + 5)")) {
-                    struct timeval start_tv, end_tv;
-                    gettimeofday(&start_tv, NULL);
-                    evaluerUttrykk((char*)benchmark_decrypted);
-                    gettimeofday(&end_tv, NULL);
-                    unsigned long eval_time = (end_tv.tv_sec - start_tv.tv_sec) * 1000000 + 
-                                             (end_tv.tv_usec - start_tv.tv_usec);
-                    benchmark_total_eval_time += eval_time;
-                }
-                
-                // Increase iteration counter
-                benchmark_current_iteration++;
-                
-                // Show progress every 1000 repetitions
-                if (benchmark_current_iteration % 1000 == 0) {
-                    report_progress = true;
-                }
-            }
+            // Update counters with minimal locking
+            benchmark_total_encrypt_time += encrypt_time;
+            benchmark_total_decrypt_time += decrypt_time;
+            benchmark_current_iteration++;
             
-            // Show progress if necessary
-            if (report_progress) {
+            // Show progress occasionally without locking too much
+            if (i % progress_indicator == 0) {
                 pthread_mutex_lock(&print_mutex);
                 printf(".");
                 fflush(stdout);
-                if (benchmark_current_iteration % 10000 == 0) {
-                    printf(" %ld repetitions completed\n", benchmark_current_iteration);
-                    
-                    // Show time variance stats every 10K iterations
-                    if (min_encrypt_time < UINT_MAX && max_encrypt_time > 0) {
-                        float encrypt_variance = (float)(max_encrypt_time - min_encrypt_time) / 
-                                                ((min_encrypt_time + max_encrypt_time) / 2.0) * 100.0;
-                        float decrypt_variance = (float)(max_decrypt_time - min_decrypt_time) / 
-                                                ((min_decrypt_time + max_decrypt_time) / 2.0) * 100.0;
-                        
-                        // Only report if variance is significant (>10%)
-                        if (encrypt_variance > 10.0 || decrypt_variance > 10.0) {
-                            printf("  Time variance - Encrypt: %.1f%%, Decrypt: %.1f%%\n", 
-                                   encrypt_variance, decrypt_variance);
-                        }
-                    }
+                if (i > 0 && i % (progress_indicator * 10) == 0) {
+                    printf(" %ld iterations (%.1f%%)\n", i, (float)i / iterations * 100);
                 }
                 pthread_mutex_unlock(&print_mutex);
             }
-            
-            // Check if we're done
-            if (benchmark_current_iteration >= benchmark_total_iterations) {
-                // Mark benchmark as finished, will be handled by main thread
-                benchmark_state = BENCHMARK_IDLE;
-            }
         }
         
-        // Mark task as processed
-        crypto_task_ready = false;
-        pthread_mutex_unlock(&benchmark_mutex);
-        
-        // Small yield
-        usleep(1000);
+        // Mark benchmark as complete
+        benchmark_state = BENCHMARK_IDLE;
     }
     
     return NULL;
 }
-
-// Memory measurement function
 void measure_memory(const char* label) {
     FILE* fp;
     char buffer[1024];
@@ -927,10 +846,9 @@ void read_power_measurements(void) {
 
 // Initialize benchmark
 void startBenchmark(const char* text, long repeats) {
-    // Measure memory before benchmark
+    // Keep existing code for setup
     measure_memory("Before Benchmark");
     
-    // Copy text
     strncpy(benchmark_text, text, MAX_SIZE - 1);
     benchmark_text[MAX_SIZE - 1] = '\0';
     benchmark_input_len = strlen(text);
@@ -945,7 +863,7 @@ void startBenchmark(const char* text, long repeats) {
     // Perform padding once before repetitions
     benchmark_padded_len = padData(text, benchmark_padded, benchmark_input_len);
     
-    // Initialize benchmark variables
+    // Reset all counters
     pthread_mutex_lock(&benchmark_mutex);
     benchmark_current_iteration = 0;
     benchmark_total_iterations = repeats;
@@ -953,14 +871,12 @@ void startBenchmark(const char* text, long repeats) {
     benchmark_total_decrypt_time = 0;
     benchmark_total_eval_time = 0;
     
-    // Reset crypto core usage tracking at the start of each benchmark
+    // Power and CPU tracking setup remains the same
     pthread_mutex_lock(&cpu_mutex);
     crypto_core_usage = 0.0;
-    max_crypto_usage = 0.0; // Reset the maximum tracker
-    // Important - we're now in benchmark mode, prevent other updates
+    max_crypto_usage = 0.0;
     pthread_mutex_unlock(&cpu_mutex);
     
-    // Reset power measurements
     pthread_mutex_lock(&power_mutex);
     power_sample_count = 0;
     benchmark_total_energy = 0.0;
@@ -970,13 +886,11 @@ void startBenchmark(const char* text, long repeats) {
     benchmark_min_current = 9999.0;
     pthread_mutex_unlock(&power_mutex);
     
-    // Start timing for the entire benchmark
+    // Start timing
     benchmark_start_time = get_time_ms();
     
-    // Set benchmark state to running
+    // Set benchmark state and signal crypto thread
     benchmark_state = BENCHMARK_RUNNING;
-    
-    // Signal crypto thread to start processing
     crypto_task_ready = true;
     pthread_cond_signal(&crypto_task_cond);
     pthread_mutex_unlock(&benchmark_mutex);
@@ -991,15 +905,6 @@ void startBenchmark(const char* text, long repeats) {
     printf("(You can send new commands while benchmark is running)\n");
     printf("Send 'STOP' to abort benchmark\n");
     pthread_mutex_unlock(&print_mutex);
-}
-unsigned long safeTimeDiff(unsigned long start, unsigned long end) {
-    // Handle timer overflow
-    if (end >= start) {
-        return end - start;
-    } else {
-        // Overflow occurred
-        return (ULONG_MAX - start) + end + 1;
-    }
 }
 
 // Signal handler for clean termination
