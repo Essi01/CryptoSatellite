@@ -66,6 +66,16 @@
         "variant": "cpp",
         "codecvt": "cpp",
         "locale": "c",
-        "xstring": "cpp"
+        "xstring": "cpp",
+        "filesystem": "c",
+        "format": "c",
+        "forward_list": "c",
+        "list": "c",
+        "ranges": "c",
+        "span": "c",
+        "xhash": "c",
+        "xiosbase": "c",
+        "xtree": "c",
+        "xutility": "c"
     }
 }
