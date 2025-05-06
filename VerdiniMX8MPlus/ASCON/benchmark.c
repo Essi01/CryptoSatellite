@@ -5,17 +5,18 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <time.h>
-#include <limits.h>
-#include <ctype.h>
-#include <sys/time.h>
-#include <pthread.h>
-#include <sched.h>   // For CPU affinity
 #include <fcntl.h>
-#include <errno.h>
+#include <sys/time.h>
 #include <signal.h>
 #include <stdbool.h>
-#include "ascon.h"
+#include <pthread.h>
+#include <sched.h>  // For CPU affinity
+#include <sys/stat.h>
+#include <linux/i2c-dev.h>
 #include <sys/ioctl.h>
+#include "ascon.h"
+#include <limits.h>
+#include <ctype.h>
 
 // INA219 configuration
 #define INA219_ADDRESS 0x40
@@ -68,6 +69,7 @@ typedef struct {
     float voltage_V;
     float power_mW;
 } PowerSample;
+
 PowerSample power_samples[POWER_SAMPLE_COUNT];
 int power_sample_count = 0;
 float benchmark_total_energy = 0.0;
@@ -85,11 +87,10 @@ typedef struct {
     unsigned long timestamp;
     float cpu_usage_percent;
 } CpuSample;
+
 CpuSample cpu_samples[POWER_SAMPLE_COUNT];
 int cpu_sample_count = 0;
 float cpu_usage = 0.0;
-float crypto_core_usage = 0.0; // CPU2 usage
-float max_crypto_usage = 0.0;  // Track maximum crypto core usage
 
 // Memory management metrics
 unsigned long used_ram = 0;
@@ -124,132 +125,52 @@ unsigned long get_time_ms(void);
 void generate_matrix_report(void);
 void read_power_measurements(void);
 void init_threads(void);
-void cleanup_threads(void);unsigned long safeTimeDiff(unsigned long start, unsigned long end);  // ADD THIS LINE
-void signal_handler(int sig);
+void cleanup_threads(void);
 
-// Initialize INA219 power monitor with better error handling
+// Initialize INA219 power monitor
+// I ina219_init()-funksjonen, legg til bedre feilhåndtering:
 void ina219_init(void) {
-    int found = 0;
-    char name_path[100];
-    char name_buf[50];
-    FILE *name_fp;
+    // Direkte spesifisering av hwmon4 som vi vet er INA219
+    hwmon_index = 4;  // Sett direkte til 4 basert på ls-kommandoen
+    hwmon_available = true;
     
-    // Try to find INA219 by scanning hwmon devices
-    for (int i = 0; i < 10; i++) {
-        snprintf(name_path, sizeof(name_path), "/sys/class/hwmon/hwmon%d/name", i);
-        name_fp = fopen(name_path, "r");
-        if (name_fp) {
-            if (fgets(name_buf, sizeof(name_buf), name_fp)) {
-                // Remove newline if present
-                size_t len = strlen(name_buf);
-                if (len > 0 && name_buf[len-1] == '\n')
-                    name_buf[len-1] = '\0';
-                
-                // Check if this is INA219
-                if (strstr(name_buf, "ina219") || strstr(name_buf, "INA219")) {
-                    hwmon_index = i;
-                    found = 1;
-                    printf("Found INA219 power monitor at hwmon%d\n", i);
-                    fclose(name_fp);
-                    break;
-                }
-            }
-            fclose(name_fp);
-        }
-    }
+    printf("Using hwmon device at index %d (INA219) for power monitoring\n", hwmon_index);
     
-    // If we didn't find by name, fall back to our known hwmon4
-    if (!found) {
-        hwmon_index = 2;
-        printf("Falling back to default hwmon device at index %d\n", hwmon_index);
-    }
-    
-    // Try alternate paths if standard paths don't work
-    char *possible_current_paths[] = {
-        "/sys/class/hwmon/hwmon%d/curr1_input",
-        "/sys/class/hwmon/hwmon%d/in0_input",   // Some devices use this naming
-        "/sys/class/hwmon/hwmon%d/current1_input"
-    };
-    
-    char *possible_voltage_paths[] = {
-        "/sys/class/hwmon/hwmon%d/in1_input",
-        "/sys/class/hwmon/hwmon%d/in2_input",
-        "/sys/class/hwmon/hwmon%d/voltage1_input"
-    };
-    
-    char *possible_power_paths[] = {
-        "/sys/class/hwmon/hwmon%d/power1_input",
-        "/sys/class/hwmon/hwmon%d/power2_input"
-    };
-    
-    // Test if we can read current
-    int current_path_idx = -1;
+    // Test lesing av strøm
     char test_path[100];
-    FILE *test_fp;
-    float test_value;
-    
-    // Find working current path
-    for (int i = 0; i < sizeof(possible_current_paths)/sizeof(char*); i++) {
-        snprintf(test_path, sizeof(test_path), possible_current_paths[i], hwmon_index);
-        test_fp = fopen(test_path, "r");
-        if (test_fp) {
-            int value;
-            if (fscanf(test_fp, "%d", &value) == 1) {
-                current_path_idx = i;
-                test_value = value / 1000.0; // Convert to mA
-                printf("Test current reading: %.2f mA (using path: %s)\n", 
-                       test_value, test_path);
-                fclose(test_fp);
-                break;
-            }
-            fclose(test_fp);
-        }
-    }
-    
-    // Find working voltage path
-    int voltage_path_idx = -1;
-    for (int i = 0; i < sizeof(possible_voltage_paths)/sizeof(char*); i++) {
-        snprintf(test_path, sizeof(test_path), possible_voltage_paths[i], hwmon_index);
-        test_fp = fopen(test_path, "r");
-        if (test_fp) {
-            int value;
-            if (fscanf(test_fp, "%d", &value) == 1) {
-                voltage_path_idx = i;
-                test_value = value / 1000.0; // Convert to V
-                printf("Test voltage reading: %.3f V (using path: %s)\n", 
-                       test_value, test_path);
-                fclose(test_fp);
-                break;
-            }
-            fclose(test_fp);
-        }
-    }
-    
-    // Find working power path
-    int power_path_idx = -1;
-    for (int i = 0; i < sizeof(possible_power_paths)/sizeof(char*); i++) {
-        snprintf(test_path, sizeof(test_path), possible_power_paths[i], hwmon_index);
-        test_fp = fopen(test_path, "r");
-        if (test_fp) {
-            int value;
-            if (fscanf(test_fp, "%d", &value) == 1) {
-                power_path_idx = i;
-                test_value = value / 1000.0; // Convert to mW
-                printf("Test power reading: %.2f mW (using path: %s)\n", 
-                       test_value, test_path);
-                fclose(test_fp);
-                break;
-            }
-            fclose(test_fp);
-        }
-    }
-    
-    // If we found at least one working path, enable power monitoring
-    if (current_path_idx >= 0 || voltage_path_idx >= 0 || power_path_idx >= 0) {
-        hwmon_available = true;
+    snprintf(test_path, sizeof(test_path), "/sys/class/hwmon/hwmon%d/curr1_input", hwmon_index);
+    FILE *test_fp = fopen(test_path, "r");
+    if (test_fp) {
+        int current_uA = 0;
+        fscanf(test_fp, "%d", &current_uA);
+        fclose(test_fp);
+        printf("Test current reading: %.2f mA\n", current_uA / 1000.0);
     } else {
-        printf("WARNING: No working power monitoring paths found. Power measurements will be disabled.\n");
-        hwmon_available = false;
+        printf("Warning: Cannot read current from %s\n", test_path);
+    }
+    
+    // Test lesing av spenning
+    snprintf(test_path, sizeof(test_path), "/sys/class/hwmon/hwmon%d/in1_input", hwmon_index);
+    test_fp = fopen(test_path, "r");
+    if (test_fp) {
+        int voltage_mV = 0;
+        fscanf(test_fp, "%d", &voltage_mV);
+        fclose(test_fp);
+        printf("Test voltage reading: %.3f V\n", voltage_mV / 1000.0);
+    } else {
+        printf("Warning: Cannot read voltage from %s\n", test_path);
+    }
+    
+    // Test lesing av effekt
+    snprintf(test_path, sizeof(test_path), "/sys/class/hwmon/hwmon%d/power1_input", hwmon_index);
+    test_fp = fopen(test_path, "r");
+    if (test_fp) {
+        int power_uW = 0;
+        fscanf(test_fp, "%d", &power_uW);
+        fclose(test_fp);
+        printf("Test power reading: %.2f mW\n", power_uW / 1000.0);
+    } else {
+        printf("Warning: Cannot read power from %s\n", test_path);
     }
 }
 
@@ -258,148 +179,65 @@ void ina219_close(void) {
     hwmon_available = false;
 }
 
-// Read current in mA using detected path
+// Read current in mA from sysfs
 float ina219_read_current(void) {
-    static int path_idx = 0;
-    static char *possible_paths[] = {
-        "/sys/class/hwmon/hwmon%d/curr1_input",
-        "/sys/class/hwmon/hwmon%d/in0_input",
-        "/sys/class/hwmon/hwmon%d/current1_input"
-    };
-    static bool paths_tried = false;
-    
     if (!hwmon_available)
         return 0.0;
     
-    // Try each path until one works
-    for (int attempt = 0; attempt < sizeof(possible_paths)/sizeof(char*); attempt++) {
-        int idx = (path_idx + attempt) % (sizeof(possible_paths)/sizeof(char*));
-        
-        char path[100];
-        snprintf(path, sizeof(path), possible_paths[idx], hwmon_index);
-        
-        FILE *fp = fopen(path, "r");
-        if (fp) {
-            int current_uA = 0;
-            int result = fscanf(fp, "%d", &current_uA);
-            fclose(fp);
-            
-            if (result == 1) {
-                if (!paths_tried) {
-                    path_idx = idx;  // Remember successful path
-                    paths_tried = true;
-                }
-                return current_uA / 1.0;  // Convert to mA
-            }
-        }
-    }
+    char path[100];
+    snprintf(path, sizeof(path), "/sys/class/hwmon/hwmon%d/curr1_input", hwmon_index);
     
-    return 0.0;  // Default if all paths fail
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return 0.0;
+    
+    int current_uA = 0;
+    fscanf(fp, "%d", &current_uA);
+    fclose(fp);
+    
+    // Convert from microamperes to milliamperes
+    return current_uA / 1000.0;
 }
 
-// Read voltage in V using detected path
+// Read voltage in V from sysfs
 float ina219_read_voltage(void) {
-    static int path_idx = 0;
-    static char *possible_paths[] = {
-        "/sys/class/hwmon/hwmon%d/in1_input",
-        "/sys/class/hwmon/hwmon%d/in2_input",
-        "/sys/class/hwmon/hwmon%d/voltage1_input"
-    };
-    static bool paths_tried = false;
-    
     if (!hwmon_available)
         return 0.0;
     
-    // Try each path until one works
-    for (int attempt = 0; attempt < sizeof(possible_paths)/sizeof(char*); attempt++) {
-        int idx = (path_idx + attempt) % (sizeof(possible_paths)/sizeof(char*));
-        
-        char path[100];
-        snprintf(path, sizeof(path), possible_paths[idx], hwmon_index);
-        
-        FILE *fp = fopen(path, "r");
-        if (fp) {
-            int voltage_mV = 0;
-            int result = fscanf(fp, "%d", &voltage_mV);
-            fclose(fp);
-            
-            if (result == 1) {
-                if (!paths_tried) {
-                    path_idx = idx;  // Remember successful path
-                    paths_tried = true;
-                }
-                // Konverter fra millivolt til volt
-                return voltage_mV / 1000.0; 
-            }
-        }
-    }
+    char path[100];
+    snprintf(path, sizeof(path), "/sys/class/hwmon/hwmon%d/in1_input", hwmon_index);
     
-    return 0.0;  // Default if all paths fail
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return 0.0;
+    
+    int voltage_mV = 0;
+    fscanf(fp, "%d", &voltage_mV);
+    fclose(fp);
+    
+    // Convert from millivolt to volt
+    return voltage_mV / 1000.0;
 }
 
-// Read power in mW using detected path
+// Read power in mW from sysfs
 float ina219_read_power(void) {
-    static int path_idx = 0;
-    static char *possible_paths[] = {
-        "/sys/class/hwmon/hwmon%d/power1_input",
-        "/sys/class/hwmon/hwmon%d/power2_input"
-    };
-    static bool paths_tried = false;
-    
     if (!hwmon_available)
         return 0.0;
     
-    // Try each path until one works
-    for (int attempt = 0; attempt < sizeof(possible_paths)/sizeof(char*); attempt++) {
-        int idx = (path_idx + attempt) % (sizeof(possible_paths)/sizeof(char*));
-        
-        char path[100];
-        snprintf(path, sizeof(path), possible_paths[idx], hwmon_index);
-        
-        FILE *fp = fopen(path, "r");
-        if (fp) {
-            int power_uW = 0;
-            int result = fscanf(fp, "%d", &power_uW);
-            fclose(fp);
-            
-            if (result == 1) {
-                if (!paths_tried) {
-                    path_idx = idx;  // Remember successful path
-                    paths_tried = true;
-                }
-                
-                // Debug print the raw value (during development)
-                static int debug_count = 0;
-                if (debug_count++ % 100 == 0) {  // Skriv ut hver 100. avlesning
-                    float current = ina219_read_current();  // Dette vil nå være i mA
-                    float voltage = ina219_read_voltage();  // Dette er i V
-                    float calc_power = current * voltage / 1000.0;  // mA * V = mW (med konvertering fra mA til A)
-                    
-                    printf("DEBUG VERIFISERING: Raw power: %d μW → %.2f mW\n", 
-                           power_uW, power_uW / 1000.0);
-                    printf("DEBUG KALKYLERT: I=%.2f mA, V=%.3f V → P=%.2f mW\n", 
-                           current, voltage, calc_power);
-                }
-                
-                return power_uW / 1000.0;
-            }
-        }
-    }
+    char path[100];
+    snprintf(path, sizeof(path), "/sys/class/hwmon/hwmon%d/power1_input", hwmon_index);
     
-    // If power reading fails, try to calculate it from current and voltage
-    float current = ina219_read_current();
-    float voltage = ina219_read_voltage();
-    if (current > 0.0 && voltage > 0.0) {
-        float calc_power = current * voltage;
-        // Debug print calculated power
-        printf("DEBUG: Using calculated power: I=%.2f mA, V=%.3f V → P=%.2f mW\n", 
-               current, voltage, calc_power);
-        return calc_power;  // P = I × V
-    }
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return 0.0;
     
-    return 0.0;  // Default if all paths fail
+    int power_uW = 0;
+    fscanf(fp, "%d", &power_uW);
+    fclose(fp);
+    
+    // Convert from microwatt to milliwatt
+    return power_uW / 1000.0;
 }
-
 
 // Set thread affinity to specific core (simplify for compatibility)
 void set_thread_affinity(pthread_t thread, int core_id) {
@@ -465,21 +303,17 @@ void *cpu_monitoring_thread(void *arg) {
     printf("CPU monitoring thread started on core %d\n", CPU_THREAD_CORE);
     pthread_mutex_unlock(&print_mutex);
     
-    // Variables for overall CPU usage calculation
+    // Variables for CPU usage calculation
     unsigned long long prev_total = 0, prev_idle = 0;
     
-    // Variables for crypto core (CPU2) usage calculation
-    unsigned long long prev_core_total = 0, prev_core_idle = 0;
-    
     while (threads_running) {
-        // Read overall CPU stats
         FILE *fp = fopen("/proc/stat", "r");
         if (fp == NULL) {
-            usleep(100000); // 100ms delay (increased from 500ms)
+            usleep(500000); // 500ms delay
             continue;
         }
         
-        // Read CPU stats for all cores
+        // Read CPU stats
         char buffer[1024];
         if (fgets(buffer, sizeof(buffer), fp)) {
             unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
@@ -523,132 +357,154 @@ void *cpu_monitoring_thread(void *arg) {
             prev_idle = idle_time;
         }
         
-        // Now read crypto core usage (CPU2) specifically
-        rewind(fp);
-        // Skip overall CPU line
-        fgets(buffer, sizeof(buffer), fp);
-        
-        // Read each core until we reach the crypto core
-        char core_line[256];
-        for (int i = 0; i <= CRYPTO_THREAD_CORE; i++) {
-            if (fgets(core_line, sizeof(core_line), fp)) {
-                if (i == CRYPTO_THREAD_CORE) {
-                    // Process the crypto core line
-                    unsigned long long c_user, c_nice, c_system, c_idle, c_iowait, c_irq, c_softirq, c_steal;
-                    int core_num;
-                    sscanf(core_line, "cpu%d %llu %llu %llu %llu %llu %llu %llu %llu", 
-                           &core_num, &c_user, &c_nice, &c_system, &c_idle, 
-                           &c_iowait, &c_irq, &c_softirq, &c_steal);
-                    
-                    // Calculate total and idle time for crypto core
-                    unsigned long long core_total = c_user + c_nice + c_system + c_idle + 
-                                                  c_iowait + c_irq + c_softirq + c_steal;
-                    unsigned long long core_idle = c_idle + c_iowait;
-                    
-                    // Calculate crypto core usage if we have previous values
-                    if (prev_core_total > 0 && prev_core_idle > 0) {
-                        unsigned long long core_total_delta = core_total - prev_core_total;
-                        unsigned long long core_idle_delta = core_idle - prev_core_idle;
-                        
-                        if (core_total_delta > 0) {
-                            float core_cpu_percent = 100.0 * (1.0 - ((float)core_idle_delta / core_total_delta));
-                            
-                            // Store crypto core usage ONLY if not in benchmark mode
-                            pthread_mutex_lock(&cpu_mutex);
-                            if (benchmark_state != BENCHMARK_RUNNING) {
-                                // Only update when not benchmarking - our calculation will take precedence
-                                crypto_core_usage = core_cpu_percent;
-                            } else {
-                                // For UI feedback during benchmark, still track but don't override
-                                if (core_cpu_percent > max_crypto_usage) {
-                                    max_crypto_usage = core_cpu_percent;
-                                }
-                            }
-                            pthread_mutex_unlock(&cpu_mutex);
-                            
-                            // Debug printing (outside the locked mutex section)
-                            if (benchmark_state == BENCHMARK_RUNNING) {
-                                pthread_mutex_lock(&print_mutex);
-                                printf("Crypto core %d usage: %.2f%% (max: %.2f%%)\n", 
-                                       CRYPTO_THREAD_CORE, core_cpu_percent, max_crypto_usage);
-                                pthread_mutex_unlock(&print_mutex);
-                            }
-                        }
-                    }
-                    
-                    // Update previous values for crypto core
-                    prev_core_total = core_total;
-                    prev_core_idle = core_idle;
-                }
-            }
-        }
-        
         fclose(fp);
-        usleep(100000); // 100ms delay (increased from 500ms for more frequent sampling)
+        usleep(500000); // 500ms delay
     }
     
     return NULL;
 }
+
 // Crypto thread function (K2)
-// Simplified crypto thread function
 void *crypto_thread(void *arg) {
     pthread_mutex_lock(&print_mutex);
     printf("Crypto thread started on core %d\n", CRYPTO_THREAD_CORE);
     pthread_mutex_unlock(&print_mutex);
     
     while (threads_running) {
-        // Use a small sleep when idle to reduce CPU usage
-        if (benchmark_state != BENCHMARK_RUNNING) {
-            usleep(10000);  // 10ms
-            continue;
+        pthread_mutex_lock(&benchmark_mutex);
+        
+        // Wait for task if none is ready
+        while (!crypto_task_ready && threads_running) {
+            pthread_cond_wait(&crypto_task_cond, &benchmark_mutex);
         }
         
-        // Process the benchmark directly here instead of complex synchronization
-        long iterations = benchmark_total_iterations;
-        size_t padded_len = benchmark_padded_len;
-        unsigned char verify_buffer[MAX_SIZE];
+        // Check if we're still running
+        if (!threads_running) {
+            pthread_mutex_unlock(&benchmark_mutex);
+            break;
+        }
         
-        // Progress indicators
-        int progress_indicator = iterations / 100;  // Show progress every 1%
-        if (progress_indicator < 10) progress_indicator = 10;
-        
-        // Run the benchmark directly
-        for (long i = 0; i < iterations && benchmark_state == BENCHMARK_RUNNING; i++) {
-            // Encryption
-            unsigned long start_time = get_time_ms();
-            encrypt(benchmark_padded, benchmark_encrypted, padded_len);
-            unsigned long end_time = get_time_ms();
-            unsigned long encrypt_time = end_time - start_time;
+        // Process benchmark chunk if running
+        if (benchmark_state == BENCHMARK_RUNNING) {
+            // Process benchmark chunk (inline for simplicity)
+            unsigned long encrypt_time, decrypt_time;
+            int chunk_size = (benchmark_total_iterations - benchmark_current_iteration < BENCHMARK_CHUNK_SIZE) ? 
+                           benchmark_total_iterations - benchmark_current_iteration : BENCHMARK_CHUNK_SIZE;
+            bool report_progress = false;
             
-            // Decryption
-            start_time = get_time_ms();
-            decrypt(benchmark_encrypted, benchmark_decrypted, padded_len + IV_SIZE + TAG_SIZE);
-            end_time = get_time_ms();
-            unsigned long decrypt_time = end_time - start_time;
+            // For statistical validation
+            static unsigned long min_encrypt_time = UINT_MAX;
+            static unsigned long max_encrypt_time = 0;
+            static unsigned long min_decrypt_time = UINT_MAX;
+            static unsigned long max_decrypt_time = 0;
             
-            // Update counters with minimal locking
-            benchmark_total_encrypt_time += encrypt_time;
-            benchmark_total_decrypt_time += decrypt_time;
-            benchmark_current_iteration++;
+            for (int i = 0; i < chunk_size; i++) {
+                // Encryption timing with verification
+                encrypt_time = encrypt(benchmark_padded, benchmark_encrypted, benchmark_padded_len);
+                benchmark_total_encrypt_time += encrypt_time;
+                
+                // Track min/max for statistical validation
+                if (encrypt_time < min_encrypt_time) min_encrypt_time = encrypt_time;
+                if (encrypt_time > max_encrypt_time) max_encrypt_time = encrypt_time;
+                
+                // Verify encryption result by decrypting and comparing (every 500th iteration to save time)
+                if (benchmark_current_iteration % 500 == 0) {
+                    unsigned char verify_buffer[MAX_SIZE];
+                    decrypt(benchmark_encrypted, verify_buffer, benchmark_padded_len + IV_SIZE + TAG_SIZE);
+                    
+                    // Check if decryption produces the original plaintext
+                    bool encryption_verified = true;
+                    for (size_t j = 0; j < benchmark_padded_len; j++) {
+                        if (verify_buffer[j] != benchmark_padded[j]) {
+                            encryption_verified = false;
+                            break;
+                        }
+                    }
+                    
+                    if (!encryption_verified) {
+                        pthread_mutex_lock(&print_mutex);
+                        printf("\nWARNING: Encryption verification failed! Results may be invalid.\n");
+                        pthread_mutex_unlock(&print_mutex);
+                    }
+                }
+                
+                // Decryption timing
+                decrypt_time = decrypt(benchmark_encrypted, benchmark_decrypted, benchmark_padded_len + IV_SIZE + TAG_SIZE);
+                benchmark_total_decrypt_time += decrypt_time;
+                
+                // Track min/max for statistical validation
+                if (decrypt_time < min_decrypt_time) min_decrypt_time = decrypt_time;
+                if (decrypt_time > max_decrypt_time) max_decrypt_time = decrypt_time;
+                
+                // Evaluation (if the text is an expression)
+                size_t actual_len = removePadding(benchmark_decrypted, benchmark_padded_len);
+                benchmark_decrypted[actual_len] = '\0';
+                
+                if (strstr((char*)benchmark_decrypted, "+") || strstr((char*)benchmark_decrypted, "-") || 
+                    strstr((char*)benchmark_decrypted, "*") || strstr((char*)benchmark_decrypted, "/") ||
+                    strstr((char*)benchmark_decrypted, "(10+5)") || strstr((char*)benchmark_decrypted, "(10 + 5)")) {
+                    struct timeval start_tv, end_tv;
+                    gettimeofday(&start_tv, NULL);
+                    evaluerUttrykk((char*)benchmark_decrypted);
+                    gettimeofday(&end_tv, NULL);
+                    unsigned long eval_time = (end_tv.tv_sec - start_tv.tv_sec) * 1000000 + 
+                                             (end_tv.tv_usec - start_tv.tv_usec);
+                    benchmark_total_eval_time += eval_time;
+                }
+                
+                // Increase iteration counter
+                benchmark_current_iteration++;
+                
+                // Show progress every 1000 repetitions
+                if (benchmark_current_iteration % 1000 == 0) {
+                    report_progress = true;
+                }
+            }
             
-            // Show progress occasionally without locking too much
-            if (i % progress_indicator == 0) {
+            // Show progress if necessary
+            if (report_progress) {
                 pthread_mutex_lock(&print_mutex);
                 printf(".");
                 fflush(stdout);
-                if (i > 0 && i % (progress_indicator * 10) == 0) {
-                    printf(" %ld iterations (%.1f%%)\n", i, (float)i / iterations * 100);
+                if (benchmark_current_iteration % 10000 == 0) {
+                    printf(" %ld repetitions completed\n", benchmark_current_iteration);
+                    
+                    // Show time variance stats every 10K iterations
+                    if (min_encrypt_time < UINT_MAX && max_encrypt_time > 0) {
+                        float encrypt_variance = (float)(max_encrypt_time - min_encrypt_time) / 
+                                                ((min_encrypt_time + max_encrypt_time) / 2.0) * 100.0;
+                        float decrypt_variance = (float)(max_decrypt_time - min_decrypt_time) / 
+                                                ((min_decrypt_time + max_decrypt_time) / 2.0) * 100.0;
+                        
+                        // Only report if variance is significant (>10%)
+                        if (encrypt_variance > 10.0 || decrypt_variance > 10.0) {
+                            printf("  Time variance - Encrypt: %.1f%%, Decrypt: %.1f%%\n", 
+                                   encrypt_variance, decrypt_variance);
+                        }
+                    }
                 }
                 pthread_mutex_unlock(&print_mutex);
             }
+            
+            // Check if we're done
+            if (benchmark_current_iteration >= benchmark_total_iterations) {
+                // Mark benchmark as finished, will be handled by main thread
+                benchmark_state = BENCHMARK_IDLE;
+            }
         }
         
-        // Mark benchmark as complete
-        benchmark_state = BENCHMARK_IDLE;
+        // Mark task as processed
+        crypto_task_ready = false;
+        pthread_mutex_unlock(&benchmark_mutex);
+        
+        // Small yield
+        usleep(1000);
     }
     
     return NULL;
 }
+
+// Memory measurement function
 void measure_memory(const char* label) {
     FILE* fp;
     char buffer[1024];
@@ -723,7 +579,7 @@ void init_threads(void) {
     set_thread_affinity(crypto_thread_id, CRYPTO_THREAD_CORE);
     
     // Give threads time to initialize
-    usleep(10000);
+    usleep(100000);
 }
 
 // Cleanup threads
@@ -753,28 +609,41 @@ void cleanup_threads(void) {
 // Generate decision matrix report
 void generate_matrix_report(void) {
     // Calculate average CPU usage from samples
-    pthread_mutex_lock(&cpu_mutex);
     float avg_cpu = 0.0;
-    int valid_samples = 0;
-    
-    // Calculate average CPU usage from recent samples
+    pthread_mutex_lock(&cpu_mutex);
     if (cpu_sample_count > 0) {
-        // Focus on the most recent samples during benchmark, not all samples
-        int start_idx = (cpu_sample_count > 20) ? (cpu_sample_count - 20) : 0; // Use last 20 samples
-        
-        for (int i = start_idx; i < cpu_sample_count; i++) {
+        for (int i = 0; i < cpu_sample_count; i++) {
             avg_cpu += cpu_samples[i].cpu_usage_percent;
-            valid_samples++;
         }
-        
-        if (valid_samples > 0) {
-            avg_cpu /= valid_samples;
-            // Save recent values to globals
-            cpu_usage = avg_cpu;
-        }
+        avg_cpu /= cpu_sample_count;
+        cpu_usage = avg_cpu;
     }
     pthread_mutex_unlock(&cpu_mutex);
+    
+    // Calculate average current from samples
+    float avg_current = 0.0;
+    pthread_mutex_lock(&power_mutex);
+    if (power_sample_count > 0) {
+        for (int i = 0; i < power_sample_count; i++) {
+            avg_current += power_samples[i].current_mA;
+        }
+        avg_current /= power_sample_count;
+        benchmark_avg_current = avg_current;
+        
+        // Calculate energy
+        if (power_sample_count > 1) {
+            float total_energy = 0.0;
+            for (int i = 1; i < power_sample_count; i++) {
+                float time_delta_s = (power_samples[i].timestamp - power_samples[i-1].timestamp) / 1000.0;
+                float avg_power = (power_samples[i].power_mW + power_samples[i-1].power_mW) / 2.0;
+                total_energy += avg_power * time_delta_s;
+            }
+            benchmark_total_energy = total_energy;
+        }
+    }
+    pthread_mutex_unlock(&power_mutex);
 }
+
 // Read and display power measurements
 void read_power_measurements(void) {
     pthread_mutex_lock(&power_mutex);
@@ -809,8 +678,8 @@ void read_power_measurements(void) {
     printf("Current (instant): %.2f mA\n", current);
     printf("Current (average): %.2f mA\n", avg_current);
     printf("Bus Voltage: %.3f V\n", voltage);
-    printf("Power (instant): %.2f mW (%.3f W)\n", power, power / 1000.0);
-    printf("Power (average): %.2f mW (%.3f W)\n", avg_power, avg_power / 1000.0);
+    printf("Power (instant): %.2f mW\n", power);
+    printf("Power (average): %.2f mW\n", avg_power);
     printf("Samples: %d\n", power_sample_count);
     printf("==========================================\n");
     pthread_mutex_unlock(&print_mutex);
@@ -846,9 +715,10 @@ void read_power_measurements(void) {
 
 // Initialize benchmark
 void startBenchmark(const char* text, long repeats) {
-    // Keep existing code for setup
+    // Measure memory before benchmark
     measure_memory("Before Benchmark");
     
+    // Copy text
     strncpy(benchmark_text, text, MAX_SIZE - 1);
     benchmark_text[MAX_SIZE - 1] = '\0';
     benchmark_input_len = strlen(text);
@@ -863,7 +733,7 @@ void startBenchmark(const char* text, long repeats) {
     // Perform padding once before repetitions
     benchmark_padded_len = padData(text, benchmark_padded, benchmark_input_len);
     
-    // Reset all counters
+    // Initialize benchmark variables
     pthread_mutex_lock(&benchmark_mutex);
     benchmark_current_iteration = 0;
     benchmark_total_iterations = repeats;
@@ -871,12 +741,7 @@ void startBenchmark(const char* text, long repeats) {
     benchmark_total_decrypt_time = 0;
     benchmark_total_eval_time = 0;
     
-    // Power and CPU tracking setup remains the same
-    pthread_mutex_lock(&cpu_mutex);
-    crypto_core_usage = 0.0;
-    max_crypto_usage = 0.0;
-    pthread_mutex_unlock(&cpu_mutex);
-    
+    // Reset power measurements
     pthread_mutex_lock(&power_mutex);
     power_sample_count = 0;
     benchmark_total_energy = 0.0;
@@ -886,11 +751,13 @@ void startBenchmark(const char* text, long repeats) {
     benchmark_min_current = 9999.0;
     pthread_mutex_unlock(&power_mutex);
     
-    // Start timing
+    // Start timing for the entire benchmark
     benchmark_start_time = get_time_ms();
     
-    // Set benchmark state and signal crypto thread
+    // Set benchmark state to running
     benchmark_state = BENCHMARK_RUNNING;
+    
+    // Signal crypto thread to start processing
     crypto_task_ready = true;
     pthread_cond_signal(&crypto_task_cond);
     pthread_mutex_unlock(&benchmark_mutex);
@@ -907,97 +774,55 @@ void startBenchmark(const char* text, long repeats) {
     pthread_mutex_unlock(&print_mutex);
 }
 
-// Signal handler for clean termination
-void signal_handler(int sig) {
-    if (sig == SIGINT) {
-        printf("\nReceived Ctrl+C, cleaning up and exiting...\n");
-        threads_running = false;
-        
-        // Wait a moment for threads to notice the flag
-        usleep(200000);
-        
-        // Force cleanup
-        cleanup_threads();
-        exit(0);
-    }
-}
-
 // Complete benchmark and report results
 void finishBenchmark(void) {
     // End timing for the entire benchmark
     unsigned long benchmark_end = get_time_ms();
-    unsigned long total_benchmark_time = safeTimeDiff(benchmark_start_time, benchmark_end);
-
-    // Calculate CPU usage specifically for crypto operations
-    float crypto_time_ms = (benchmark_total_encrypt_time + benchmark_total_decrypt_time) / 1000.0;
-    float wall_time_ms = total_benchmark_time;
-    float crypto_cpu_usage_pct = (crypto_time_ms / wall_time_ms) * 100.0;
-
-    // Set both CPU usage values to ensure consistency
+    unsigned long total_benchmark_time = benchmark_end - benchmark_start_time;
+    
+    // Calculate actual CPU usage from the CPU monitor thread
     pthread_mutex_lock(&cpu_mutex);
-    cpu_usage = crypto_cpu_usage_pct;
-    crypto_core_usage = crypto_cpu_usage_pct; // Use our accurate calculation
-    max_crypto_usage = crypto_cpu_usage_pct;  // Ensure max is also consistent
+    float avg_cpu = 0.0;
+    if (cpu_sample_count > 0) {
+        for (int i = 0; i < cpu_sample_count; i++) {
+            avg_cpu += cpu_samples[i].cpu_usage_percent;
+        }
+        avg_cpu /= cpu_sample_count;
+        cpu_usage = avg_cpu;
+    } else {
+        // Fallback calculation if no CPU samples
+        cpu_usage = (benchmark_total_encrypt_time + benchmark_total_decrypt_time) / 1000.0 / 
+                    total_benchmark_time * 100.0;
+    }
     pthread_mutex_unlock(&cpu_mutex);
-
-    // Now handle power measurements
+    
+    // Calculate energy from power samples
     pthread_mutex_lock(&power_mutex);
     float avg_current = 0.0;
-    float avg_voltage = 0.0;
-    float avg_power = 0.0;
-    
     if (power_sample_count > 0) {
-        // Calculate averages
         for (int i = 0; i < power_sample_count; i++) {
             avg_current += power_samples[i].current_mA;
-            avg_voltage += power_samples[i].voltage_V;
-            avg_power += power_samples[i].power_mW;
         }
         avg_current /= power_sample_count;
-        avg_voltage /= power_sample_count;
-        avg_power /= power_sample_count;
         benchmark_avg_current = avg_current;
         
-        // Calculate total energy - THIS PART NEEDS FIXING
+        // Calculate total energy in millijoule
         if (power_sample_count > 1) {
             float total_energy = 0.0;
             for (int i = 1; i < power_sample_count; i++) {
                 float time_delta_s = (power_samples[i].timestamp - power_samples[i-1].timestamp) / 1000.0;
-                float block_avg_power = (power_samples[i].power_mW + power_samples[i-1].power_mW) / 2.0;
-                total_energy += block_avg_power * time_delta_s;
+                float avg_power = (power_samples[i].power_mW + power_samples[i-1].power_mW) / 2.0;
+                total_energy += avg_power * time_delta_s;
             }
             benchmark_total_energy = total_energy;
-        } else if (power_sample_count == 1) {
-            // Fallback for single sample
-            float duration_s = (get_time_ms() - benchmark_start_time) / 1000.0;
-            benchmark_total_energy = avg_power * duration_s;
+        } else {
+            // Fallback calculation if only one sample
+            float voltage = power_samples[0].voltage_V;
+            float benchmark_seconds = total_benchmark_time / 1000.0;
+            benchmark_total_energy = benchmark_avg_current * benchmark_seconds * voltage;
         }
     }
     pthread_mutex_unlock(&power_mutex);
-
-    // Beregn flere energimetrikker med riktige konverteringer
-    float avg_power_w = avg_power / 1000.0;                    // mW til W
-    float energy_j = benchmark_total_energy / 1000.0;          // mJ til J
-    float energy_wh = benchmark_total_energy / 3600000.0;      // mJ til Wh
-    float crypto_energy_mj = (crypto_time_ms / 1000.0) * avg_power; // Energi brukt bare på krypto
-    float per_byte_energy = benchmark_total_energy / (benchmark_total_iterations * benchmark_padded_len); // mJ per byte
-
-    // Skriv ut strømmålinger UTENFOR mutex-låsen med alle detaljene
-    printf("\n==========================================\n");
-    printf("         POWER MEASUREMENTS              \n");
-    printf("==========================================\n");
-    printf("Average current: %.2f mA (%.6f A)\n", benchmark_avg_current, benchmark_avg_current / 1000.0);
-    if (benchmark_min_current < 9999.0 && benchmark_max_current > 0) {
-    printf("Current range: %.2f - %.2f mA\n", benchmark_min_current, benchmark_max_current);
-    }
-    printf("Bus voltage: %.3f V\n", avg_voltage);
-    printf("Average power: %.2f mW (%.6f W)\n", avg_power, avg_power_w);
-    printf("Energy consumption: %.2f mJ (%.6f J)\n", benchmark_total_energy, energy_j);
-    printf("Energy in watt-hours: %.8f Wh\n", energy_wh);
-    printf("Energy per operation: %.6f mJ/op\n", benchmark_total_energy / benchmark_total_iterations);
-    printf("Energy per byte: %.6f µJ/byte\n", per_byte_energy * 1000.0);
-    printf("Crypto operations energy: %.2f mJ (%.2f%%)\n", crypto_energy_mj, 
-       (crypto_energy_mj / benchmark_total_energy) * 100.0);
     
     // Calculate total combined time and average
     unsigned long total_combined_time = benchmark_total_encrypt_time + benchmark_total_decrypt_time;
@@ -1029,7 +854,7 @@ void finishBenchmark(void) {
     printf("Total decryption time: %lu µs\n", benchmark_total_decrypt_time);
     printf("Total combined time: %lu µs\n", total_combined_time);
     printf("Total benchmark time: %lu ms\n", total_benchmark_time);
-    printf("Crypto core usage: %.2f%%\n", crypto_core_usage);
+    printf("Actual CPU usage: %.2f%%\n", cpu_usage);
     
     printf("\nAverage time per operation:\n");
     printf("  Encryption: %.2f µs\n", avgEnc);
@@ -1049,16 +874,13 @@ void finishBenchmark(void) {
     printf("\n==========================================\n");
     printf("         POWER MEASUREMENTS              \n");
     printf("==========================================\n");
-    printf("Average current: %.2f mA (%.6f A)\n", benchmark_avg_current, benchmark_avg_current / 1000.0);
-
+    printf("Average current: %.2f mA\n", benchmark_avg_current);
+    
     if (benchmark_min_current < 9999.0 && benchmark_max_current > 0) {
-    printf("Current range: %.2f - %.2f mA\n", benchmark_min_current, benchmark_max_current);
-}
-
-printf("Bus voltage: %.3f V\n", avg_voltage);
-printf("Energy consumption: %.2f mJ (%.6f J, %.8f Wh)\n", 
-       benchmark_total_energy, energy_j, energy_wh);
-printf("Energy efficiency: %.6f µJ/byte\n", per_byte_energy * 1000.0);
+        printf("Current range: %.2f - %.2f mA\n", benchmark_min_current, benchmark_max_current);
+    }
+    
+    printf("Energy consumption: %.2f mJ\n", benchmark_total_energy);
     
     if (benchmark_total_eval_time > 0) {
         printf("\n==========================================\n");
@@ -1096,241 +918,17 @@ printf("Energy efficiency: %.6f µJ/byte\n", per_byte_energy * 1000.0);
     measure_memory("After Benchmark");
 }
 
-void processImageFile(const char* filename, int iterations) {
-    FILE *fp = fopen(filename, "rb");
-    if (!fp) {
-        pthread_mutex_lock(&print_mutex);
-        printf("Failed to open file: %s\n", filename);
-        pthread_mutex_unlock(&print_mutex);
-        return;
-    }
-    
-    // Get file extension from filename (to create correct decrypted filename)
-    char file_extension[16] = ".jpg"; // Default if no filetype is found
-    const char *dot = strrchr(filename, '.');
-    if (dot && strlen(dot) < 15) {
-        // Copy the filetype (including the dot)
-        strcpy(file_extension, dot);
-    }
-    
-    // Create filename for decrypted file
-    char decrypted_filename[128] = "decrypted";
-    strcat(decrypted_filename, file_extension);
-    
-    // Read file size
-    fseek(fp, 0, SEEK_END);
-    size_t filesize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    
+// Signal handler for clean exit
+void signal_handler(int sig) {
     pthread_mutex_lock(&print_mutex);
-    printf("\nStarting image encryption for %s (%zu bytes) with %d iterations...\n", 
-           filename, filesize, iterations);
+    printf("\nExiting...\n");
     pthread_mutex_unlock(&print_mutex);
     
-    // Allocate buffer
-    unsigned char *buffer = malloc(filesize);
-    unsigned char *encrypted = malloc(filesize + IV_SIZE + TAG_SIZE);
-    unsigned char *decrypted = malloc(filesize);
+    // Stop threads
+    cleanup_threads();
     
-    if (!buffer || !encrypted || !decrypted) {
-        pthread_mutex_lock(&print_mutex);
-        printf("Error: Failed to allocate memory for file processing\n");
-        pthread_mutex_unlock(&print_mutex);
-        
-        fclose(fp);
-        if (buffer) free(buffer);
-        if (encrypted) free(encrypted);
-        if (decrypted) free(decrypted);
-        return;
-    }
-    
-    // Read the file
-    if (fread(buffer, 1, filesize, fp) != filesize) {
-        pthread_mutex_lock(&print_mutex);
-        printf("Failed to read entire file\n");
-        pthread_mutex_unlock(&print_mutex);
-        
-        fclose(fp);
-        free(buffer);
-        free(encrypted);
-        free(decrypted);
-        return;
-    }
-    fclose(fp);
-    
-    // Start continuous power measurement if not already running
-    bool was_benchmark_running = (benchmark_state == BENCHMARK_RUNNING);
-    
-    if (!was_benchmark_running) {
-        // Reset power measurements to get clean measurements for the image operation
-        pthread_mutex_lock(&power_mutex);
-        power_sample_count = 0;
-        benchmark_total_energy = 0.0;
-        benchmark_avg_current = 0.0;
-        benchmark_max_current = 0.0;
-        benchmark_min_current = 9999.0;
-        pthread_mutex_unlock(&power_mutex);
-        
-        pthread_mutex_lock(&cpu_mutex);
-        crypto_core_usage = 0.0;
-        max_crypto_usage = 0.0;
-        pthread_mutex_unlock(&cpu_mutex);
-    }
-    
-    // Memory measurement before encryption
-    measure_memory("Before Image Encryption");
-    
-    // Start timing
-    unsigned long start_time = get_time_ms();
-    unsigned long total_encrypt_time = 0;
-    unsigned long total_decrypt_time = 0;
-    
-    // Perform encryption/decryption iterations times
-    for (int i = 0; i < iterations; i++) {
-        // Encrypt data
-        unsigned long encrypt_time = encrypt(buffer, encrypted, filesize);
-        total_encrypt_time += encrypt_time;
-        
-        // Decrypt data
-        unsigned long decrypt_time = decrypt(encrypted, decrypted, filesize + IV_SIZE + TAG_SIZE);
-        total_decrypt_time += decrypt_time;
-        
-        // Show progress every 100 iterations
-        if (i > 0 && i % 100 == 0) {
-            pthread_mutex_lock(&print_mutex);
-            printf(".");
-            fflush(stdout);
-            if (i % 500 == 0) {
-                printf(" %d iterations completed\n", i);
-            }
-            pthread_mutex_unlock(&print_mutex);
-        }
-    }
-    
-    // End timing
-    unsigned long total_time = safeTimeDiff(start_time, get_time_ms());
-    
-    // Verify that decryption was successful
-    bool verification_success = true;
-    for (size_t i = 0; i < filesize; i++) {
-        if (buffer[i] != decrypted[i]) {
-            verification_success = false;
-            break;
-        }
-    }
-    
-    // Save encrypted file
-    FILE *enc_fp = fopen("encrypted.bin", "wb");
-    if (enc_fp) {
-        fwrite(encrypted, 1, filesize + IV_SIZE + TAG_SIZE, enc_fp);
-        fclose(enc_fp);
-    } else {
-        pthread_mutex_lock(&print_mutex);
-        printf("Failed to create encrypted file\n");
-        pthread_mutex_unlock(&print_mutex);
-    }
-    
-    // Save decrypted file
-    FILE *dec_fp = fopen(decrypted_filename, "wb");
-    if (dec_fp) {
-        fwrite(decrypted, 1, filesize, dec_fp);
-        fclose(dec_fp);
-    } else {
-        pthread_mutex_lock(&print_mutex);
-        printf("Failed to create decrypted file\n");
-        pthread_mutex_unlock(&print_mutex);
-    }
-    
-    // Memory measurement after encryption
-    measure_memory("After Image Processing");
-    
-    // Get power measurements
-    pthread_mutex_lock(&power_mutex);
-    float avg_current = 0.0;
-    float avg_voltage = 0.0;
-    float avg_power = 0.0;
-    
-    if (power_sample_count > 0) {
-        for (int i = 0; i < power_sample_count; i++) {
-            avg_current += power_samples[i].current_mA;
-            avg_voltage += power_samples[i].voltage_V;
-            avg_power += power_samples[i].power_mW;
-        }
-        avg_current /= power_sample_count;
-        avg_voltage /= power_sample_count;
-        avg_power /= power_sample_count;
-    }
-    pthread_mutex_unlock(&power_mutex);
-    
-    // Get CPU usage
-    pthread_mutex_lock(&cpu_mutex);
-    float cpu_percent = 0.0;
-    if (cpu_sample_count > 0) {
-        // Use the last 20 samples for best accuracy
-        int start_idx = (cpu_sample_count > 20) ? (cpu_sample_count - 20) : 0;
-        int valid_samples = 0;
-        
-        for (int i = start_idx; i < cpu_sample_count; i++) {
-            cpu_percent += cpu_samples[i].cpu_usage_percent;
-            valid_samples++;
-        }
-        
-        if (valid_samples > 0) {
-            cpu_percent /= valid_samples;
-        }
-    }
-    float core_usage = crypto_core_usage; // Crypto core usage
-    pthread_mutex_unlock(&cpu_mutex);
-    
-    // Calculate energy consumption
-    float duration_s = total_time / 1000.0;
-    float energy_mj = avg_power * duration_s;
-    float energy_j = energy_mj / 1000.0;
-    float energy_uj_per_byte = (energy_mj * 1000.0) / (filesize * iterations);
-    
-    // Calculate throughput
-    float avg_enc_time = total_encrypt_time / (float)iterations;
-    float avg_dec_time = total_decrypt_time / (float)iterations;
-    float enc_mb_per_s = (filesize * 1.0 / avg_enc_time) * 1000000 / (1024*1024);
-    float dec_mb_per_s = (filesize * 1.0 / avg_dec_time) * 1000000 / (1024*1024);
-    float combined_mb_per_s = (filesize * 2.0 / (avg_enc_time + avg_dec_time)) * 1000000 / (1024*1024);
-    
-    pthread_mutex_lock(&print_mutex);
-    printf("\n==========================================\n");
-    printf("         IMAGE PROCESSING RESULTS         \n");
-    printf("==========================================\n");
-    printf("File: %s\n", filename);
-    printf("Size: %zu bytes (%.2f MB)\n", filesize, filesize / (1024.0*1024.0));
-    printf("Iterations: %d\n", iterations);
-    printf("Verification: %s\n", verification_success ? "✅ Success - Decryption verified" : "❌ Failed - Data mismatch");
-    
-    printf("\nPerformance:\n");
-    printf("Average encryption time: %.2f µs (%.2f ms)\n", avg_enc_time, avg_enc_time / 1000.0);
-    printf("Average decryption time: %.2f µs (%.2f ms)\n", avg_dec_time, avg_dec_time / 1000.0);
-    printf("Total processing time: %lu ms\n", total_time);
-    printf("Throughput (encryption): %.2f MB/s\n", enc_mb_per_s);
-    printf("Throughput (decryption): %.2f MB/s\n", dec_mb_per_s);
-    printf("Throughput (combined): %.2f MB/s\n", combined_mb_per_s);
-    
-    printf("\nPower metrics:\n");
-    printf("Current: %.2f mA\n", avg_current);
-    printf("Voltage: %.3f V\n", avg_voltage);
-    printf("Power: %.2f mW (%.6f W)\n", avg_power, avg_power / 1000.0);
-    printf("Energy consumption: %.2f mJ (%.6f J)\n", energy_mj, energy_j);
-    printf("Energy per byte: %.2f µJ/byte\n", energy_uj_per_byte);
-    printf("CPU usage: %.2f%% (crypto core: %.2f%%)\n", cpu_percent, core_usage);
-    
-    printf("\nOutput files:\n");
-    printf("Encrypted file saved as: encrypted.bin\n");
-    printf("Decrypted file saved as: %s\n", decrypted_filename);
-    printf("==========================================\n");
-    pthread_mutex_unlock(&print_mutex);
-    
-    free(buffer);
-    free(encrypted);
-    free(decrypted);
+    exit(0);
 }
-
 
 int main(int argc, char *argv[]) {
     char input[1024];
@@ -1400,6 +998,7 @@ int main(int argc, char *argv[]) {
                     printf("> %s\n", input);
                     pthread_mutex_unlock(&print_mutex);
                     
+                    // Check if benchmark should be stopped
                     if (strcasecmp(input, "STOP") == 0 && benchmark_state == BENCHMARK_RUNNING) {
                         pthread_mutex_lock(&print_mutex);
                         printf("Aborting benchmark...\n");
@@ -1421,51 +1020,29 @@ int main(int argc, char *argv[]) {
                     else if (strcasecmp(input, "MATRIX") == 0) {
                         generate_matrix_report();
                     }
-                    // IMAGE command handler (for bitmap files)
-                    else if (strncasecmp(input, "IMAGE", 5) == 0 && benchmark_state == BENCHMARK_IDLE) {
-                        // Parse command: IMAGE <iterations> <filename>
-                        char* token = input + 5;
-                        while (*token && isspace(*token)) token++; // Skip spaces
-                        
-                        // Get iterations
-                        char* iterations_str = token;
-                        while (*token && !isspace(*token)) token++;
-                        if (*token) {
-                            *token++ = '\0'; // Terminate iterations string
-                            while (*token && isspace(*token)) token++; // Skip spaces
-                        }
-                        
-                        // Get filename
-                        char* filename = token;
-                        
-                        // Convert iterations to number
-                        int iterations = atoi(iterations_str);
-                        if (iterations <= 0 || strlen(filename) == 0) {
-                            pthread_mutex_lock(&print_mutex);
-                            printf("Usage: IMAGE <iterations> <filename>\n");
-                            pthread_mutex_unlock(&print_mutex);
-                        } else {
-                            processImageFile(filename, iterations);
-                        }
-                    }
                     // Check if it's a repeat command with flexible formatting
                     else if ((strncasecmp(input, "REPEAT", 6) == 0) && benchmark_state == BENCHMARK_IDLE) {
                         // Find first number in the input
                         int i = 0;
                         while (input[i] != '\0' && !isdigit(input[i])) i++;
+
                         int start = i;
                         // Read the number (all subsequent digits)
                         while (input[i] != '\0' && isdigit(input[i])) i++;
+
                         if (start < i) {
                             // Get the repeat count
                             char countStr[32] = {0};
                             strncpy(countStr, input + start, i - start);
                             long repeatCount = atol(countStr);
+
                             // Skip any spaces after the number
                             while (input[i] != '\0' && isspace(input[i])) i++;
+
                             // The rest is the text to be processed
                             char textStr[MAX_SIZE] = {0};
                             strcpy(textStr, input + i);
+
                             if (repeatCount > 0 && strlen(textStr) > 0) {
                                 startBenchmark(textStr, repeatCount);
                             } else {
@@ -1500,14 +1077,18 @@ int main(int argc, char *argv[]) {
                         unsigned char padded[MAX_SIZE] = { 0 };
                         unsigned char encrypted[MAX_SIZE + IV_SIZE + TAG_SIZE] = { 0 }; // Extra space for IV and tag
                         unsigned char decrypted[MAX_SIZE] = { 0 };
+
                         // Add padding
                         size_t input_len = strlen(input);
                         size_t padded_len = padData(input, padded, input_len);
+
                         // Encrypt data
                         unsigned long encrypt_time = encrypt(padded, encrypted, padded_len);
                         size_t encrypted_len = padded_len + IV_SIZE + TAG_SIZE;
+
                         // Decryption
                         unsigned long decrypt_time = decrypt(encrypted, decrypted, encrypted_len);
+
                         pthread_mutex_lock(&print_mutex);
                         printf("\n==========================================\n");
                         printf("         SINGLE OPERATION RESULTS        \n");
@@ -1516,6 +1097,7 @@ int main(int argc, char *argv[]) {
                         printHex(encrypted, (encrypted_len < 32) ? encrypted_len : 32);
                         printf("Encryption time: %lu µs\n", encrypt_time);
                         printf("Decryption time: %lu µs\n", decrypt_time);
+
                         // Calculate throughput and goodput
                         float encrypt_throughput = padded_len * 1e6 / encrypt_time;
                         float decrypt_throughput = padded_len * 1e6 / decrypt_time;
@@ -1526,6 +1108,7 @@ int main(int argc, char *argv[]) {
                         printf("Decryption throughput: %.0f bytes/s\n", decrypt_throughput);
                         printf("Encryption goodput: %.0f bytes/s\n", encrypt_goodput);
                         printf("Decryption goodput: %.0f bytes/s\n", decrypt_goodput);
+
                         // Get CPU usage from monitor
                         float cpu_percent = 0.0;
                         pthread_mutex_lock(&cpu_mutex);
@@ -1534,6 +1117,7 @@ int main(int argc, char *argv[]) {
                         }
                         pthread_mutex_unlock(&cpu_mutex);
                         printf("CPU usage: %.2f%%\n", cpu_percent);
+
                         // Get power measurements
                         float current = 0.0, voltage = 0.0, power = 0.0;
                         pthread_mutex_lock(&power_mutex);
@@ -1545,7 +1129,8 @@ int main(int argc, char *argv[]) {
                         pthread_mutex_unlock(&power_mutex);
                         
                         printf("Current: %.2f mA\n", current);
-                        printf("Power: %.2f mW (%.3f W)\n", power, power / 1000.0);
+                        printf("Power: %.2f mW\n", power);
+
                         // Remove padding and null-terminate
                         size_t actual_len = removePadding(decrypted, padded_len);
                         decrypted[actual_len] = '\0';
