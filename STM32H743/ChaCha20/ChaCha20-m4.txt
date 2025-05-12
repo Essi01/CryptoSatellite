@@ -1,0 +1,459 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file    main.c
+  * @brief   Main program body for Cortex-M4 core
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "cmsis_os.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <math.h>
+#include "stm32h7xx_hal.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#ifndef HSEM_ID_0
+#define HSEM_ID_0 (0U) /* HW semaphore 0*/
+#endif
+
+#define INA226_I2C_ADDRESS 0x40
+#define SHUNT_RESISTOR_VALUE 0.1f  // 100 mOhm
+#define MAX_CURRENT 3.0f           // 3A range
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+COM_InitTypeDef BspCOMInit;
+
+I2C_HandleTypeDef hi2c1;
+
+osThreadId defaultTaskHandle;
+/* USER CODE BEGIN PV */
+// Shared memory for inter-processor communication
+__attribute__((section(".RAM_D3"))) volatile float M4_current_mA = 0.0f;
+__attribute__((section(".RAM_D3"))) volatile float M4_voltage_V = 0.0f;
+__attribute__((section(".RAM_D3"))) volatile float M4_power_mW = 0.0f;
+__attribute__((section(".RAM_D3"))) volatile uint8_t M4_ready = 0;
+__attribute__((section(".RAM_D3"))) volatile uint8_t M7_request_power = 0;
+
+uint16_t ina226_calibration_value = 0;
+bool ina226_available = false;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+void StartDefaultTask(void const * argument);
+
+/* USER CODE BEGIN PFP */
+bool INA226_Init(void);
+uint16_t INA226_ReadReg(uint8_t reg);
+void INA226_WriteReg(uint8_t reg, uint16_t value);
+float INA226_GetShuntVoltage_mV(void);
+float INA226_GetBusVoltage_V(void);
+float INA226_GetCurrent_mA(void);
+float INA226_GetPower_mW(void);
+void INA226_SetCalibration(uint16_t cal_value);
+void INA226_SetAlertLimit(uint16_t alert_limit);
+void INA226_EnableAlertLatch(void);
+void INA226_EnableAlertFlag(void);
+void INA226_EnableAlertConversion(void);
+uint16_t INA226_CalculateCalibrationValue(float r_shunt, float i_max);
+void ReadPowerMeasurements(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+// INA226 registers
+#define INA226_REG_CONFIG           0x00  // Configuration Register
+#define INA226_REG_SHUNTVOLTAGE     0x01  // Shunt Voltage Register
+#define INA226_REG_BUSVOLTAGE       0x02  // Bus Voltage Register
+#define INA226_REG_POWER            0x03  // Power Register
+#define INA226_REG_CURRENT          0x04  // Current Register
+#define INA226_REG_CALIBRATION      0x05  // Calibration Register
+#define INA226_REG_MASKENABLE       0x06  // Mask/Enable Register
+#define INA226_REG_ALERTLIMIT       0x07  // Alert Limit Register
+#define INA226_REG_MANUFACTURER_ID  0xFE  // Manufacturer ID Register
+#define INA226_REG_DIE_ID           0xFF  // Die ID Register
+
+// Configuration register bits
+#define INA226_MODE_POWER_DOWN      0x0000
+#define INA226_MODE_SHUNT_TRIG      0x0001
+#define INA226_MODE_BUS_TRIG        0x0002
+#define INA226_MODE_SHUNT_BUS_TRIG  0x0003
+#define INA226_MODE_ADC_OFF         0x0004
+#define INA226_MODE_SHUNT_CONT      0x0005
+#define INA226_MODE_BUS_CONT        0x0006
+#define INA226_MODE_SHUNT_BUS_CONT  0x0007
+
+#define INA226_VSH_140uS            0x0000
+#define INA226_VSH_204uS            0x0008
+#define INA226_VSH_332uS            0x0010
+#define INA226_VSH_588uS            0x0018
+#define INA226_VSH_1100uS           0x0020
+#define INA226_VSH_2116uS           0x0028
+#define INA226_VSH_4156uS           0x0030
+#define INA226_VSH_8244uS           0x0038
+
+#define INA226_VBUS_140uS           0x0000
+#define INA226_VBUS_204uS           0x0040
+#define INA226_VBUS_332uS           0x0080
+#define INA226_VBUS_588uS           0x00C0
+#define INA226_VBUS_1100uS          0x0100
+#define INA226_VBUS_2116uS          0x0140
+#define INA226_VBUS_4156uS          0x0180
+#define INA226_VBUS_8244uS          0x01C0
+
+#define INA226_AVG_1                0x0000
+#define INA226_AVG_4                0x0200
+#define INA226_AVG_16               0x0400
+#define INA226_AVG_64               0x0600
+#define INA226_AVG_128              0x0800
+#define INA226_AVG_256              0x0A00
+#define INA226_AVG_512              0x0C00
+#define INA226_AVG_1024             0x0E00
+
+// Helper functions for I2C communication with INA226
+bool INA226_Init(void) {
+  // Read manufacturer ID to check if INA226 is responsive
+  uint16_t man_id = INA226_ReadReg(INA226_REG_MANUFACTURER_ID);
+  if (man_id != 0x5449) { // TI manufacturer ID
+    return false;
+  }
+
+  // Calculate calibration value
+  uint16_t cal_value = INA226_CalculateCalibrationValue(SHUNT_RESISTOR_VALUE, MAX_CURRENT);
+
+  // Configure INA226
+  uint16_t config = INA226_AVG_16 |       // 16 samples averaging
+                   INA226_VBUS_1100uS |   // 1.1ms bus voltage conversion time
+                   INA226_VSH_1100uS |    // 1.1ms shunt voltage conversion time
+                   INA226_MODE_SHUNT_BUS_CONT; // Continuous shunt and bus measurements
+
+  INA226_WriteReg(INA226_REG_CONFIG, config);
+  INA226_SetCalibration(cal_value);
+
+  return true;
+}
+
+uint16_t INA226_ReadReg(uint8_t reg) {
+  uint8_t data[2];
+  HAL_I2C_Mem_Read(&hi2c1, (INA226_I2C_ADDRESS << 1), reg, I2C_MEMADD_SIZE_8BIT, data, 2, 100);
+  return (data[0] << 8) | data[1];
+}
+
+void INA226_WriteReg(uint8_t reg, uint16_t value) {
+  uint8_t data[2];
+  data[0] = (value >> 8) & 0xFF;
+  data[1] = value & 0xFF;
+  HAL_I2C_Mem_Write(&hi2c1, (INA226_I2C_ADDRESS << 1), reg, I2C_MEMADD_SIZE_8BIT, data, 2, 100);
+}
+
+float INA226_GetShuntVoltage_mV(void) {
+  int16_t value = (int16_t)INA226_ReadReg(INA226_REG_SHUNTVOLTAGE);
+  return value * 0.0025f; // LSB is 2.5 µV
+}
+
+float INA226_GetBusVoltage_V(void) {
+  uint16_t value = INA226_ReadReg(INA226_REG_BUSVOLTAGE);
+  return value * 0.00125f; // LSB is 1.25 mV
+}
+
+float INA226_GetCurrent_mA(void) {
+  int16_t value = (int16_t)INA226_ReadReg(INA226_REG_CURRENT);
+  return value * 0.1f; // Depends on calibration, assuming LSB = 0.1 mA
+}
+
+float INA226_GetPower_mW(void) {
+  uint16_t value = INA226_ReadReg(INA226_REG_POWER);
+  return value * 2.5f; // Depends on calibration, assuming LSB = 2.5 mW
+}
+
+void INA226_SetCalibration(uint16_t cal_value) {
+  ina226_calibration_value = cal_value;
+  INA226_WriteReg(INA226_REG_CALIBRATION, cal_value);
+}
+
+uint16_t INA226_CalculateCalibrationValue(float r_shunt, float i_max) {
+  // r_shunt in ohms, i_max in amps
+  uint16_t cal_value = (uint16_t)((0.00512f) / (r_shunt * i_max / 32768.0f));
+  return cal_value;
+}
+
+void ReadPowerMeasurements(void) {
+  if (ina226_available) {
+    float current_mA = INA226_GetCurrent_mA();
+    float voltage_V = INA226_GetBusVoltage_V();
+    float power_mW = INA226_GetPower_mW();
+
+    // Update shared memory variables
+    M4_current_mA = current_mA;
+    M4_voltage_V = voltage_V;
+    M4_power_mW = power_mW;
+    M4_ready = 1;
+  }
+}
+
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+/* USER CODE BEGIN Boot_Mode_Sequence_1 */
+  /*HW semaphore Clock enable*/
+  __HAL_RCC_HSEM_CLK_ENABLE();
+  /* Activate HSEM notification for Cortex-M4*/
+  HAL_HSEM_ActivateNotification(__HAL_HSEM_SEMID_TO_MASK(HSEM_ID_0));
+  /*
+  Domain D2 goes to STOP mode (Cortex-M4 in deep-sleep) waiting for Cortex-M7 to
+  perform system initialization (system clock config, external memory configuration.. )
+  */
+  HAL_PWREx_ClearPendingEvent();
+  HAL_PWREx_EnterSTOPMode(PWR_MAINREGULATOR_ON, PWR_STOPENTRY_WFE, PWR_D2_DOMAIN);
+  /* Clear HSEM flag */
+  __HAL_HSEM_CLEAR_FLAG(__HAL_HSEM_SEMID_TO_MASK(HSEM_ID_0));
+
+/* USER CODE END Boot_Mode_Sequence_1 */
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  /* USER CODE BEGIN 2 */
+  // Initialize INA226 power monitor
+  ina226_available = INA226_Init();
+
+  // Indicate that M4 core is ready
+  M4_ready = 1;
+  HAL_Delay(100);
+  M4_ready = 0;
+  /* USER CODE END 2 */
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* definition and creation of defaultTask */
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 128);
+  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* Initialize leds */
+  BSP_LED_Init(LED_GREEN);
+  BSP_LED_Init(LED_YELLOW);
+  BSP_LED_Init(LED_RED);
+
+  /* Initialize USER push-button, will be used to trigger an interrupt each time it's pressed.*/
+  BSP_PB_Init(BUTTON_USER, BUTTON_MODE_EXTI);
+
+  /* Initialize COM1 port (115200, 8 bits (7-bit data + 1 stop bit), no parity */
+  BspCOMInit.BaudRate   = 115200;
+  BspCOMInit.WordLength = COM_WORDLENGTH_8B;
+  BspCOMInit.StopBits   = COM_STOPBITS_1;
+  BspCOMInit.Parity     = COM_PARITY_NONE;
+  BspCOMInit.HwFlowCtl  = COM_HWCONTROL_NONE;
+  if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE)
+  {
+    Error_Handler();
+  }
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    // Check if M7 core is requesting power measurement
+    if (M7_request_power) {
+      ReadPowerMeasurements();
+      HAL_Delay(10); // Give M7 time to read
+      M7_request_power = 0;
+    }
+
+    HAL_Delay(1);
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x00B03DD0;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void const * argument)
+{
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
