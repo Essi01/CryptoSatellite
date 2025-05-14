@@ -1,6 +1,6 @@
 import pandas as pd
+# This script calculates the total latency for different encryption algorithms on various boards.
 # Compute total latency (encrypt + decrypt + 50 ms delay) per algorithm/board and print in seconds
-# This script calculates the total latency for different encryption algorithms on various boards,
 
 # Define latency data: [encryption µs, decryption µs]
 data = {
