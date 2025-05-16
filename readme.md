@@ -2,7 +2,7 @@
 
 **CryptoSatellite** is a bachelor's thesis project focused on evaluating symmetric encryption algorithms for secure satellite communication in resource-constrained environments.
 
-The project investigates how encryption impacts performance on embedded platforms simulating satellite onboard computers. Algorithms such as AES, SPECK, ASCON, and ChaCha20 are tested across multiple microcontrollers, including Portenta H7, Portenta X8, STM32H743ZIT6, and Verdin iMX8M Plus.
+The project investigates how encryption impacts performance on embedded platforms simulating satellite onboard computers. Algorithms such as AES, SPECK, ASCON, and ChaCha20 are tested across multiple embedded hardware platforms, including Portenta H7, Portenta X8, STM32H743ZIT6, and Verdin iMX8M Plus.
 
 ## Features
 
