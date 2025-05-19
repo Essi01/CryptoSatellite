@@ -14,7 +14,7 @@ The project investigates how encryption impacts performance on embedded platform
 ## Structure
 
 - `portentaH7/`, `portentaX8/`, `stm32h743/`, `verdinimx8mplus/`: Platform-specific encryption tests
--  `input/`: Test data inputs for Test 1, Test 2, and Test 3 (e.g., `test1_input.txt`, `test2_input.txt`, `test3_input.jpg`)
+-  `input/`: Test data inputs for Test 1, Test 2, and Test 3 (`test1_input.txt`, `test2_input.txt`, `test3_input.jpg`)
 - `total_latency_summary.py`: Calculates total latency across platforms and algorithms + 50 ms to account for latency in spcae
 
 ## Purpose
