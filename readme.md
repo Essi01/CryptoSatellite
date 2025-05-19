@@ -7,7 +7,7 @@ The project investigates how encryption impacts performance on embedded platform
 ## Features
 
 - Performance testing of symmetric encryption (latency, memory, energy usage)
-- Hardware benchmarking in bare-metal and Linux environments
+- Hardware benchmarking in bare metal and Linux environments
 - Simulated communication between satellite and ground station
 - Focus on real-world constraints in CubeSat-like systems
 
